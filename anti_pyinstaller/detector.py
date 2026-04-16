@@ -16,6 +16,16 @@ class PyInstallerInfo:
     file_count: int
 
 
+@dataclass
+class TOCEntry:
+    name: str
+    offset: int
+    size: int
+    compressed_size: int
+    is_compressed: bool
+    entry_type: bytes
+
+
 MAGIC_PATTERNS = [
     b"MEI\x0c\x0b\x0a\x0b\x0e",
     b"MEI\x0c\x0b\x0a\x0e",
@@ -26,6 +36,10 @@ MAGIC_PATTERNS = [
 
 PYINST20_COOKIE_SIZE = 24
 PYINST21_COOKIE_SIZE = 88
+
+MAX_TOC_ENTRIES = 10000
+MAX_ENTRY_SIZE = 10 * 1024 * 1024
+MAX_OVERLAY_SIZE = 500 * 1024 * 1024
 
 PYC_MAGIC_TO_VERSION = {
     b"\x33\x0d\x0d\x0a": (3, 1),
@@ -60,6 +74,11 @@ def detect(path: Path) -> PyInstallerInfo | None:
 
     if not path.is_file():
         logger.error(f"Not a file: {path}")
+        return None
+
+    file_size = path.stat().st_size
+    if file_size < 1024:
+        logger.error(f"File too small: {file_size} bytes")
         return None
 
     platform = _detect_platform(path)
@@ -98,8 +117,16 @@ def detect(path: Path) -> PyInstallerInfo | None:
                 )
                 pyinst_ver = "2.0"
 
-            if pyver == 0:
-                logger.error("Invalid Python version in cookie")
+            if pyver == 0 or pyver > 1000:
+                logger.error(f"Invalid Python version: {pyver}")
+                return None
+
+            if lengthofPackage < 0 or lengthofPackage > MAX_OVERLAY_SIZE:
+                logger.error(f"Invalid overlay size: {lengthofPackage}")
+                return None
+
+            if toc_offset < 0 or tocLen < 0 or tocLen > file_size:
+                logger.error(f"Invalid TOC: offset={toc_offset}, len={tocLen}")
                 return None
 
             pymaj = pyver // 100 if pyver >= 100 else pyver // 10
@@ -117,12 +144,20 @@ def detect(path: Path) -> PyInstallerInfo | None:
             overlay_pos = file_size - overlay_size
             toc_pos = overlay_pos + toc_offset
 
+            if toc_pos < 0 or toc_pos >= file_size:
+                logger.error(f"Invalid TOC position: {toc_pos}")
+                return None
+
             logger.debug(f"TOC at {toc_pos}, size {tocLen}")
 
             f.seek(toc_pos, 0)
             toc_data = f.read(tocLen)
 
-            (file_count, entry_point, encrypted) = _parse_toc_info(toc_data, overlay_pos)
+            (entries, entry_point, encrypted, skipped) = _parse_toc_info(
+                toc_data, overlay_pos, file_size
+            )
+
+            logger.info(f"TOC: {len(entries)} entries, {skipped} skipped")
 
         return PyInstallerInfo(
             is_pyinstaller=True,
@@ -131,7 +166,7 @@ def detect(path: Path) -> PyInstallerInfo | None:
             platform=platform,
             is_encrypted=encrypted,
             entry_point=entry_point,
-            file_count=file_count,
+            file_count=len(entries),
         )
     except Exception as e:
         logger.error(f"Failed to parse: {e}")
@@ -187,52 +222,107 @@ def _find_cookie(path: Path) -> int:
     return cookie_pos
 
 
-def _parse_toc_info(toc_data: bytes, overlay_pos: int) -> tuple[int, str | None, bool]:
-    pos = 0
-    file_count = 0
+def _parse_toc_info(
+    toc_data: bytes, overlay_pos: int, file_size: int
+) -> tuple[list[TOCEntry], str | None, bool, int]:
+    entries = []
     entry_point = None
     encrypted = False
+    skipped = 0
+    pos = 0
+    iterations = 0
 
     fixed_part_size = struct.calcsize("!IIIBc")
 
     while pos < len(toc_data):
+        iterations += 1
+        if iterations > MAX_TOC_ENTRIES:
+            logger.warn(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+            break
+
         if pos + 4 > len(toc_data):
-            logger.debug(f"TOC parsing: truncated at pos {pos}")
+            logger.debug(f"TOC: truncated at pos {pos}")
             break
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
 
-        if entry_size <= 0:
-            logger.debug(f"TOC parsing: invalid entry size {entry_size} at pos {pos}")
-            break
+        if entry_size <= 0 or entry_size > MAX_ENTRY_SIZE:
+            logger.debug(f"TOC: invalid entry size {entry_size}")
+            skipped += 1
+            pos += 4
+            continue
 
         if pos + entry_size > len(toc_data):
-            logger.debug(f"TOC parsing: entry exceeds data at pos {pos}")
+            logger.debug(f"TOC: entry exceeds data")
+            skipped += 1
             break
 
         entry_bytes = toc_data[pos + 4 : pos + entry_size]
 
         if len(entry_bytes) < fixed_part_size:
-            logger.debug(f"TOC: entry too small ({len(entry_bytes)} < {fixed_part_size})")
+            logger.debug(f"TOC: entry too small")
+            skipped += 1
             pos += entry_size
             continue
 
-        file_count += 1
+        try:
+            (entry_pos, cmprsd_size, uncmprsd_size, cmprs_flag, type_byte) = struct.unpack(
+                "!IIIBc", entry_bytes[:fixed_part_size]
+            )
 
-        if b"_crypto_key" in entry_bytes:
-            encrypted = True
-            logger.debug("Found encryption key")
+            if entry_pos < 0 or cmprsd_size < 0 or uncmprsd_size < 0:
+                logger.debug(f"TOC: negative values in entry")
+                skipped += 1
+                pos += entry_size
+                continue
 
-        name_bytes = entry_bytes[fixed_part_size:]
-        name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+            name_bytes = entry_bytes[fixed_part_size:]
+            try:
+                name = name_bytes.rstrip(b"\x00").decode("utf-8")
+            except UnicodeDecodeError:
+                name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
 
-        if name.endswith(".pyc") and entry_point is None:
-            entry_point = name
-            logger.debug(f"Entry point: {name}")
+            name = name.lstrip("/")
+
+            if not name:
+                pos += entry_size
+                continue
+
+            name = name.replace("..", "__")
+
+            abs_pos = overlay_pos + entry_pos
+            if abs_pos < 0 or abs_pos >= file_size:
+                logger.debug(f"TOC: invalid offset {abs_pos}")
+                skipped += 1
+                pos += entry_size
+                continue
+
+            entry = TOCEntry(
+                name=name,
+                offset=abs_pos,
+                size=uncmprsd_size,
+                compressed_size=cmprsd_size,
+                is_compressed=cmprs_flag == 1,
+                entry_type=type_byte,
+            )
+            entries.append(entry)
+
+            if b"_crypto_key" in entry_bytes:
+                encrypted = True
+                logger.debug("Found encryption key")
+
+            if type_byte == b"s" and entry_point is None:
+                entry_point = name
+                logger.debug(f"Entry point: {name}")
+
+        except Exception as e:
+            logger.debug(f"TOC parse error: {e}")
+            skipped += 1
+            pass
 
         pos += entry_size
 
-    return file_count, entry_point, encrypted
+    return entries, entry_point, encrypted, skipped
 
 
 def python_magic_to_version(magic: bytes) -> tuple[int, int] | None:

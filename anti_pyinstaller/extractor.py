@@ -25,6 +25,16 @@ class ExtractionResult:
     message: str
 
 
+@dataclass
+class TOCEntry:
+    name: str
+    offset: int
+    size: int
+    compressed_size: int
+    is_compressed: bool
+    entry_type: bytes
+
+
 MAGIC_PATTERNS = [
     b"MEI\x0c\x0b\x0a\x0b\x0e",
     b"MEI\x0c\x0b\x0a\x0e",
@@ -36,23 +46,9 @@ MAGIC_PATTERNS = [
 PYINST20_COOKIE_SIZE = 24
 PYINST21_COOKIE_SIZE = 88
 
-
-class CTOCEntry:
-    def __init__(
-        self,
-        position: int,
-        cmprsd_size: int,
-        uncmprsd_size: int,
-        cmprs_flag: int,
-        type_byte: bytes,
-        name: str,
-    ):
-        self.position = position
-        self.cmprsd_size = cmprsd_size
-        self.uncmprsd_size = uncmprsd_size
-        self.cmprs_flag = cmprs_flag
-        self.type_byte = type_byte
-        self.name = name
+MAX_TOC_ENTRIES = 10000
+MAX_ENTRY_SIZE = 10 * 1024 * 1024
+MAX_OVERLAY_SIZE = 500 * 1024 * 1024
 
 
 def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResult:
@@ -68,6 +64,10 @@ def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResul
     if file_size < 1024:
         logger.error(f"File too small: {file_size} bytes")
         return ExtractionResult(False, Path(""), None, "File too small")
+
+    if file_size > MAX_OVERLAY_SIZE * 2:
+        logger.error(f"File too large: {file_size} bytes (max {MAX_OVERLAY_SIZE * 2})")
+        return ExtractionResult(False, Path(""), None, "File too large")
 
     platform = _detect_platform(input_file)
     if platform == "unknown":
@@ -171,9 +171,17 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
             cookie_size = PYINST20_COOKIE_SIZE
             pyinst_ver = "2.0"
 
-        if pyver == 0:
-            logger.error("Invalid Python version")
+        if pyver == 0 or pyver > 1000:
+            logger.error(f"Invalid Python version: {pyver}")
             return ExtractionResult(False, output_dir, None, "Invalid Python version")
+
+        if lengthofPackage < 0 or lengthofPackage > MAX_OVERLAY_SIZE:
+            logger.error(f"Invalid overlay size: {lengthofPackage}")
+            return ExtractionResult(False, output_dir, None, "Invalid overlay size")
+
+        if toc_offset < 0 or tocLen < 0 or tocLen > file_size:
+            logger.error(f"Invalid TOC: offset={toc_offset}, len={tocLen}")
+            return ExtractionResult(False, output_dir, None, "Invalid TOC")
 
         pymaj = pyver // 100 if pyver >= 100 else pyver // 10
         pymin = pyver % 100 if pyver >= 100 else pyver % 10
@@ -185,18 +193,22 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
         overlay_pos = file_size - overlay_size
         toc_pos = overlay_pos + toc_offset
 
+        if toc_pos < 0 or toc_pos >= file_size:
+            logger.error(f"Invalid TOC position: {toc_pos}")
+            return ExtractionResult(False, output_dir, None, "Invalid TOC position")
+
         f.seek(toc_pos, 0)
         toc_data = f.read(tocLen)
 
-        entries, entry_point = _parse_toc_entries(toc_data, overlay_pos)
+        entries, entry_point, skipped = _parse_toc_entries(toc_data, overlay_pos, file_size)
 
-        logger.debug(f"Found {len(entries)} TOC entries")
+        logger.info(f"TOC: {len(entries)} entries, {skipped} skipped")
 
         pyc_magic = None
         encrypted = False
 
         for entry in entries:
-            if entry.type_byte == b"M" and pyc_magic is None:
+            if entry.entry_type == b"M" and pyc_magic is None:
                 if _has_pyc_header(entry, f):
                     data = _read_entry_data(f, entry)
                     if data and len(data) >= 4:
@@ -229,32 +241,45 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
         return ExtractionResult(True, output_dir, info, f"Extracted {len(entries)} files")
 
 
-def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntry], str | None]:
+def _parse_toc_entries(
+    toc_data: bytes, overlay_pos: int, file_size: int
+) -> tuple[list[TOCEntry], str | None, int]:
     entries = []
     entry_point = None
+    skipped = 0
     pos = 0
+    iterations = 0
 
     fixed_part_size = struct.calcsize("!IIIBc")
 
     while pos < len(toc_data):
+        iterations += 1
+        if iterations > MAX_TOC_ENTRIES:
+            logger.warn(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+            break
+
         if pos + 4 > len(toc_data):
             logger.debug(f"TOC: truncated at pos {pos}")
             break
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
 
-        if entry_size <= 0:
-            logger.debug(f"TOC: invalid entry size {entry_size}")
-            break
+        if entry_size <= 0 or entry_size > MAX_ENTRY_SIZE:
+            logger.debug(f"TOC: invalid entry size {entry_size}, skipping")
+            skipped += 1
+            pos += 4
+            continue
 
         if pos + entry_size > len(toc_data):
-            logger.debug(f"TOC: entry exceeds buffer")
+            logger.debug(f"TOC: entry exceeds buffer, skipping")
+            skipped += 1
             break
 
         entry_bytes = toc_data[pos + 4 : pos + entry_size]
 
         if len(entry_bytes) < fixed_part_size:
-            logger.debug(f"TOC: entry too small")
+            logger.debug(f"TOC: entry too small, skipping")
+            skipped += 1
             pos += entry_size
             continue
 
@@ -263,8 +288,17 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
                 "!IIIBc", entry_bytes[:fixed_part_size]
             )
 
+            if entry_pos < 0 or cmprsd_size < 0 or uncmprsd_size < 0:
+                logger.debug(f"TOC: negative values in entry, skipping")
+                skipped += 1
+                pos += entry_size
+                continue
+
             name_bytes = entry_bytes[fixed_part_size:]
-            name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+            try:
+                name = name_bytes.rstrip(b"\x00").decode("utf-8")
+            except UnicodeDecodeError:
+                name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
 
             name = name.lstrip("/")
 
@@ -274,13 +308,20 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
 
             name = _sanitize_path(name)
 
-            entry = CTOCEntry(
-                position=overlay_pos + entry_pos,
-                cmprsd_size=cmprsd_size,
-                uncmprsd_size=uncmprsd_size,
-                cmprs_flag=cmprs_flag,
-                type_byte=type_byte,
+            abs_pos = overlay_pos + entry_pos
+            if abs_pos < 0 or abs_pos >= file_size:
+                logger.debug(f"TOC: invalid offset {abs_pos}, skipping entry")
+                skipped += 1
+                pos += entry_size
+                continue
+
+            entry = TOCEntry(
                 name=name,
+                offset=abs_pos,
+                size=uncmprsd_size,
+                compressed_size=cmprsd_size,
+                is_compressed=cmprs_flag == 1,
+                entry_type=type_byte,
             )
             entries.append(entry)
 
@@ -290,11 +331,12 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
 
         except Exception as e:
             logger.debug(f"TOC parse error: {e}")
+            skipped += 1
             pass
 
         pos += entry_size
 
-    return entries, entry_point
+    return entries, entry_point, skipped
 
 
 def _sanitize_path(name: str) -> str:
@@ -303,20 +345,20 @@ def _sanitize_path(name: str) -> str:
     return name
 
 
-def _has_pyc_header(entry: CTOCEntry, f) -> bool:
-    f.seek(entry.position, 0)
-    data = f.read(min(entry.cmprsd_size, 16))
+def _has_pyc_header(entry: TOCEntry, f) -> bool:
+    f.seek(entry.offset, 0)
+    data = f.read(min(entry.compressed_size, 16))
     if len(data) >= 4:
         if data[2:4] == b"\r\n":
             return True
     return False
 
 
-def _read_entry_data(f, entry: CTOCEntry):
-    f.seek(entry.position, 0)
-    data = f.read(entry.cmprsd_size)
+def _read_entry_data(f, entry: TOCEntry):
+    f.seek(entry.offset, 0)
+    data = f.read(entry.compressed_size)
 
-    if entry.cmprs_flag == 1:
+    if entry.is_compressed:
         try:
             data = zlib.decompress(data)
         except zlib.error as e:
@@ -326,14 +368,14 @@ def _read_entry_data(f, entry: CTOCEntry):
     return data
 
 
-def _write_entry(f, entry: CTOCEntry, output_dir: Path, pyc_magic: bytes | None = None) -> bool:
+def _write_entry(f, entry: TOCEntry, output_dir: Path, pyc_magic: bytes | None = None) -> bool:
     data = _read_entry_data(f, entry)
     if data is None:
         return False
 
     name = entry.name
 
-    if entry.type_byte == b"s":
+    if entry.entry_type == b"s":
         name = name + ".pyc"
         _write_pyc_with_header(output_dir / name, data, pyc_magic)
         return True
