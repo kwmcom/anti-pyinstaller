@@ -2,8 +2,8 @@
 !README.md
 !pyproject.toml
 !.gitignore
-!anti_pynstaller/
-!anti_pynstaller/**
+!anti_pyinstaller/
+!anti_pyinstaller/**
 
 *.py[cod]
 __pycache__/
