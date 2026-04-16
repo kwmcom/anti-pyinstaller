@@ -1,0 +1,14 @@
+*
+!README.md
+!pyproject.toml
+!.gitignore
+!anti_pynstaller/
+!anti_pynstaller/**
+
+*.py[cod]
+__pycache__/
+*.egg-info/
+.venv/
+.vscode/
+.idea/
+tests/
