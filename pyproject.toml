@@ -1,8 +1,8 @@
 [project]
-name = "anti-pynstaller"
+name = "anti-pyinstaller"
 version = "0.1.0"
-description = "Automated PyInstaller executable extractor"
-authors = [{name = "anti-pynstaller"}]
+description = "PyInstaller extractor and disassembler"
+authors = [{name = "anti-pyinstaller"}]
 readme = "README.md"
 requires-python = ">=3.12"
 
@@ -12,7 +12,7 @@ dev = [
 ]
 
 [project.scripts]
-anti-pynstaller = "anti_pynstaller:main"
+anti-pyinstaller = "anti_pyinstaller:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -20,7 +20,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["anti_pynstaller*"]
+include = ["anti_pyinstaller*"]
 
 [tool.ruff]
 target-version = "py312"
