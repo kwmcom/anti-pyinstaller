@@ -5,7 +5,7 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from anti_pyinstaller import logger
+from src import logger
 
 
 @dataclass

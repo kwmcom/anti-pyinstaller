@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from anti_pyinstaller import detector, disasm, extractor, pyc_fixer, logger
+from src import detector, disasm, extractor, pyc_fixer, logger
 
 
 def main():
