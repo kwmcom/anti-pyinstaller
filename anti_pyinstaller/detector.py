@@ -2,6 +2,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from anti_pyinstaller import logger
+
 
 @dataclass
 class PyInstallerInfo:
@@ -52,16 +54,25 @@ PYC_MAGIC_TO_VERSION = {
 
 
 def detect(path: Path) -> PyInstallerInfo | None:
-    if not path.exists() or not path.is_file():
+    if not path.exists():
+        logger.error(f"File not found: {path}")
+        return None
+
+    if not path.is_file():
+        logger.error(f"Not a file: {path}")
         return None
 
     platform = _detect_platform(path)
     if platform == "unknown":
+        logger.error("Unknown file format (not ELF or PE)")
         return None
 
     cookie_pos = _find_cookie(path)
     if cookie_pos == -1:
+        logger.error("PyInstaller cookie not found")
         return None
+
+    logger.debug(f"Cookie found at offset {cookie_pos}")
 
     try:
         with open(path, "rb") as f:
@@ -70,6 +81,7 @@ def detect(path: Path) -> PyInstallerInfo | None:
 
             magic = cookie_data[:8]
             if magic[:3] != b"MEI":
+                logger.error("Invalid magic bytes")
                 return None
 
             f.seek(cookie_pos + PYINST20_COOKIE_SIZE, 0)
@@ -87,6 +99,7 @@ def detect(path: Path) -> PyInstallerInfo | None:
                 pyinst_ver = "2.0"
 
             if pyver == 0:
+                logger.error("Invalid Python version in cookie")
                 return None
 
             pymaj = pyver // 100 if pyver >= 100 else pyver // 10
@@ -104,6 +117,8 @@ def detect(path: Path) -> PyInstallerInfo | None:
             overlay_pos = file_size - overlay_size
             toc_pos = overlay_pos + toc_offset
 
+            logger.debug(f"TOC at {toc_pos}, size {tocLen}")
+
             f.seek(toc_pos, 0)
             toc_data = f.read(tocLen)
 
@@ -118,7 +133,9 @@ def detect(path: Path) -> PyInstallerInfo | None:
             entry_point=entry_point,
             file_count=file_count,
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to parse: {e}")
+        logger.debug(f"Exception details: {type(e).__name__}: {e}")
         return None
 
 
@@ -156,6 +173,7 @@ def _find_cookie(path: Path) -> int:
 
                 if offs != -1:
                     cookie_pos = start_pos + offs
+                    logger.debug(f"Found magic pattern at {cookie_pos}")
                     break
 
                 end_pos = start_pos + len(magic_pattern) - 1
@@ -175,29 +193,42 @@ def _parse_toc_info(toc_data: bytes, overlay_pos: int) -> tuple[int, str | None,
     entry_point = None
     encrypted = False
 
+    fixed_part_size = struct.calcsize("!IIIBc")
+
     while pos < len(toc_data):
         if pos + 4 > len(toc_data):
+            logger.debug(f"TOC parsing: truncated at pos {pos}")
             break
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
-        if entry_size <= 0 or pos + entry_size > len(toc_data):
+
+        if entry_size <= 0:
+            logger.debug(f"TOC parsing: invalid entry size {entry_size} at pos {pos}")
+            break
+
+        if pos + entry_size > len(toc_data):
+            logger.debug(f"TOC parsing: entry exceeds data at pos {pos}")
             break
 
         entry_bytes = toc_data[pos + 4 : pos + entry_size]
-        if len(entry_bytes) >= 17:
-            file_count += 1
 
-        if entry_bytes and b"_crypto_key" in entry_bytes:
+        if len(entry_bytes) < fixed_part_size:
+            logger.debug(f"TOC: entry too small ({len(entry_bytes)} < {fixed_part_size})")
+            pos += entry_size
+            continue
+
+        file_count += 1
+
+        if b"_crypto_key" in entry_bytes:
             encrypted = True
+            logger.debug("Found encryption key")
 
-        if len(entry_bytes) >= 18:
-            fixed_part_size = struct.calcsize("!IIIBc")
-            if len(entry_bytes) >= fixed_part_size:
-                name_bytes = entry_bytes[fixed_part_size:]
-                name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
+        name_bytes = entry_bytes[fixed_part_size:]
+        name = name_bytes.rstrip(b"\x00").decode("utf-8", errors="replace")
 
-                if name.endswith(".pyc") and entry_point is None:
-                    entry_point = name
+        if name.endswith(".pyc") and entry_point is None:
+            entry_point = name
+            logger.debug(f"Entry point: {name}")
 
         pos += entry_size
 

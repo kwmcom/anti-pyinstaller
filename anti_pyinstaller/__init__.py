@@ -1,13 +1,19 @@
 import sys
 from pathlib import Path
 
-from anti_pyinstaller import detector, disasm, extractor, pyc_fixer
+from anti_pyinstaller import detector, disasm, extractor, pyc_fixer, logger
 
 
 def main():
+    verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    if verbose:
+        sys.argv = [a for a in sys.argv if a not in ("-v", "--verbose")]
+        logger.set_verbose(True)
+
     if len(sys.argv) < 2:
-        print("Usage: anti-pynstaller <command> <args>")
+        print("Usage: anti-pyinstaller <command> <args>")
         print("Commands: detect, extract, disassemble, dis")
+        print("Options: -v, --verbose")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -19,7 +25,6 @@ def main():
         file = Path(sys.argv[2])
         info = detector.detect(file)
         if info is None:
-            print("Not a PyInstaller executable")
             sys.exit(1)
         print(
             f"PyInstaller {info.version}, Python {info.python_version[0]}.{info.python_version[1]}"
@@ -36,7 +41,7 @@ def main():
         file = Path(sys.argv[2])
         result = extractor.extract(file, None)
         if not result.success:
-            print(f"Error: {result.message}")
+            logger.error(result.message)
             sys.exit(1)
         print(f"Extracted to {result.output_dir}")
         pyc_fixer.fix_directory(result.output_dir)
@@ -60,7 +65,7 @@ def main():
         if result.success:
             print(f"Written to {result.output_path}")
         else:
-            print(f"Error: {result.message}")
+            logger.error(result.message)
             sys.exit(1)
 
     else:

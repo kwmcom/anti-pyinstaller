@@ -5,6 +5,8 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from anti_pyinstaller import logger
+
 
 @dataclass
 class ArchiveInfo:
@@ -53,86 +55,42 @@ class CTOCEntry:
         self.name = name
 
 
-def detect(input_file: Path) -> ArchiveInfo | None:
-    with open(input_file, "rb") as f:
-        f.seek(0, 2)
-        file_size = f.tell()
-
-        cookie_pos = _find_cookie(f, file_size)
-        if cookie_pos == -1:
-            return None
-
-        cookie_data = f.read(PYINST21_COOKIE_SIZE)
-        if len(cookie_data) < PYINST20_COOKIE_SIZE:
-            return None
-
-        magic = cookie_data[:8]
-        if magic[:3] != b"MEI":
-            return None
-
-        f.seek(cookie_pos + PYINST20_COOKIE_SIZE, 0)
-        cookie_check = f.read(64)
-
-        if b"python" in cookie_check.lower():
-            (magic_bytes, lengthofPackage, toc_offset, tocLen, pyver, pylibname) = struct.unpack(
-                "!8sIIii64s", cookie_data
-            )
-            pyinst_ver = "2.1+"
-        else:
-            (magic_bytes, lengthofPackage, toc_offset, tocLen, pyver) = struct.unpack(
-                "!8siiii", cookie_data[:24]
-            )
-            pyinst_ver = "2.0"
-
-        if pyver == 0:
-            return None
-
-        pymaj = pyver // 100 if pyver >= 100 else pyver // 10
-        pymin = pyver % 100 if pyver >= 100 else pyver % 10
-        python_ver = (pymaj, pymin)
-
-        tail_bytes = (
-            file_size
-            - cookie_pos
-            - (PYINST21_COOKIE_SIZE if pyinst_ver == "2.1+" else PYINST20_COOKIE_SIZE)
-        )
-        overlay_size = lengthofPackage + tail_bytes
-        overlay_pos = file_size - overlay_size
-
-        toc_pos = overlay_pos + toc_offset
-
-        f.seek(toc_pos, 0)
-        toc_data = f.read(tocLen)
-
-        entries, entry_point = _parse_toc_entries(toc_data, overlay_pos)
-        file_count = len(entries)
-
-        return ArchiveInfo(
-            pyinstaller_ver=pyinst_ver,
-            python_ver=python_ver,
-            file_count=file_count,
-            entry_point=entry_point,
-        )
-
-
 def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResult:
     if not input_file.exists():
-        return ExtractionResult(False, Path(""), None, "File not found: " + str(input_file))
+        logger.error(f"File not found: {input_file}")
+        return ExtractionResult(False, Path(""), None, "File not found")
+
+    if not input_file.is_file():
+        logger.error(f"Not a file: {input_file}")
+        return ExtractionResult(False, Path(""), None, "Not a file")
+
+    file_size = input_file.stat().st_size
+    if file_size < 1024:
+        logger.error(f"File too small: {file_size} bytes")
+        return ExtractionResult(False, Path(""), None, "File too small")
 
     platform = _detect_platform(input_file)
     if platform == "unknown":
+        logger.error("Unknown file format (not ELF or PE)")
         return ExtractionResult(False, Path(""), None, "Unknown file format")
 
     if output_dir is None:
         output_dir = input_file.parent / f"{input_file.stem}_extracted"
 
+    if output_dir.exists() and any(output_dir.iterdir()):
+        logger.warn(f"Output directory exists and is not empty: {output_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.debug(f"Extracting to: {output_dir}")
 
     try:
         result = _extract_archive(input_file, output_dir)
         return result
     except Exception as e:
-        return ExtractionResult(False, output_dir, None, f"Extraction failed: {e}")
+        logger.error(f"Extraction failed: {e}")
+        logger.debug(f"Exception: {type(e).__name__}: {e}")
+        return ExtractionResult(False, output_dir, None, str(e))
 
 
 def _detect_platform(path: Path) -> str:
@@ -165,6 +123,7 @@ def _find_cookie(f, file_size: int) -> int:
 
             if offs != -1:
                 cookie_pos = start_pos + offs
+                logger.debug(f"Found cookie at {cookie_pos}")
                 break
 
             end_pos = start_pos + len(magic_pattern) - 1
@@ -185,16 +144,16 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
 
         cookie_pos = _find_cookie(f, file_size)
         if cookie_pos == -1:
-            return ExtractionResult(
-                False, output_dir, None, "Cookie not found: not a PyInstaller archive"
-            )
+            logger.error("PyInstaller cookie not found")
+            return ExtractionResult(False, output_dir, None, "Cookie not found")
 
         f.seek(cookie_pos, 0)
         cookie_data = f.read(PYINST21_COOKIE_SIZE)
 
         magic = cookie_data[:8]
         if magic[:3] != b"MEI":
-            return ExtractionResult(False, output_dir, None, "Invalid magic bytes")
+            logger.error("Invalid magic bytes")
+            return ExtractionResult(False, output_dir, None, "Invalid magic")
 
         f.seek(cookie_pos + PYINST20_COOKIE_SIZE, 0)
         cookie_check = f.read(64)
@@ -213,10 +172,13 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
             pyinst_ver = "2.0"
 
         if pyver == 0:
+            logger.error("Invalid Python version")
             return ExtractionResult(False, output_dir, None, "Invalid Python version")
 
         pymaj = pyver // 100 if pyver >= 100 else pyver // 10
         pymin = pyver % 100 if pyver >= 100 else pyver % 10
+
+        logger.debug(f"PyInstaller {pyinst_ver}, Python {pymaj}.{pymin}")
 
         tail_bytes = file_size - cookie_pos - cookie_size
         overlay_size = lengthofPackage + tail_bytes
@@ -228,10 +190,11 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
 
         entries, entry_point = _parse_toc_entries(toc_data, overlay_pos)
 
+        logger.debug(f"Found {len(entries)} TOC entries")
+
         pyc_magic = None
         encrypted = False
 
-        # First pass: find pyc magic from PYPACKAGE entries
         for entry in entries:
             if entry.type_byte == b"M" and pyc_magic is None:
                 if _has_pyc_header(entry, f):
@@ -241,13 +204,17 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
 
             if entry.name.endswith("_crypto_key"):
                 encrypted = True
+                logger.debug("Found encryption key")
 
-        # Second pass: write entries
+        written = 0
         for entry in entries:
-            _write_entry(f, entry, output_dir, pyc_magic)
+            if _write_entry(f, entry, output_dir, pyc_magic):
+                written += 1
+
+        logger.debug(f"Wrote {written} files")
 
         if encrypted:
-            print("[!] Encrypted archive detected - extraction may be incomplete")
+            logger.warn("Encrypted archive - some files may not extract")
 
         _extract_pyz_archives(output_dir, pyc_magic)
 
@@ -267,25 +234,31 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
     entry_point = None
     pos = 0
 
+    fixed_part_size = struct.calcsize("!IIIBc")
+
     while pos < len(toc_data):
         if pos + 4 > len(toc_data):
+            logger.debug(f"TOC: truncated at pos {pos}")
             break
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
-        if entry_size <= 0 or pos + entry_size > len(toc_data):
+
+        if entry_size <= 0:
+            logger.debug(f"TOC: invalid entry size {entry_size}")
+            break
+
+        if pos + entry_size > len(toc_data):
+            logger.debug(f"TOC: entry exceeds buffer")
             break
 
         entry_bytes = toc_data[pos + 4 : pos + entry_size]
-        if len(entry_bytes) < 17:
+
+        if len(entry_bytes) < fixed_part_size:
+            logger.debug(f"TOC: entry too small")
             pos += entry_size
             continue
 
         try:
-            fixed_part_size = struct.calcsize("!IIIBc")
-            if len(entry_bytes) < fixed_part_size:
-                pos += entry_size
-                continue
-
             (entry_pos, cmprsd_size, uncmprsd_size, cmprs_flag, type_byte) = struct.unpack(
                 "!IIIBc", entry_bytes[:fixed_part_size]
             )
@@ -296,7 +269,10 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
             name = name.lstrip("/")
 
             if not name:
+                pos += entry_size
                 continue
+
+            name = _sanitize_path(name)
 
             entry = CTOCEntry(
                 position=overlay_pos + entry_pos,
@@ -308,16 +284,23 @@ def _parse_toc_entries(toc_data: bytes, overlay_pos: int) -> tuple[list[CTOCEntr
             )
             entries.append(entry)
 
-            # Type 's' (PYSOURCE) is the entry point script
             if type_byte == b"s" and entry_point is None:
                 entry_point = name + ".pyc"
+                logger.debug(f"Entry point: {entry_point}")
 
-        except Exception:
+        except Exception as e:
+            logger.debug(f"TOC parse error: {e}")
             pass
 
         pos += entry_size
 
     return entries, entry_point
+
+
+def _sanitize_path(name: str) -> str:
+    name = name.replace("..", "__")
+    name = name.lstrip("/")
+    return name
 
 
 def _has_pyc_header(entry: CTOCEntry, f) -> bool:
@@ -336,32 +319,41 @@ def _read_entry_data(f, entry: CTOCEntry):
     if entry.cmprs_flag == 1:
         try:
             data = zlib.decompress(data)
-        except zlib.error:
+        except zlib.error as e:
+            logger.debug(f"Decompress failed for {entry.name}: {e}")
             return None
 
     return data
 
 
-def _write_entry(f, entry: CTOCEntry, output_dir: Path, pyc_magic: bytes | None = None):
+def _write_entry(f, entry: CTOCEntry, output_dir: Path, pyc_magic: bytes | None = None) -> bool:
     data = _read_entry_data(f, entry)
     if data is None:
-        return
+        return False
 
     name = entry.name
 
-    # Type 's' is PYSOURCE - write as .pyc file (raw code object needs header)
     if entry.type_byte == b"s":
         name = name + ".pyc"
         _write_pyc_with_header(output_dir / name, data, pyc_magic)
-        return
+        return True
 
     out_path = output_dir / name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(data)
+
+    try:
+        out_path.write_bytes(data)
+        return True
+    except Exception as e:
+        logger.debug(f"Write failed for {name}: {e}")
+        return False
 
 
 def _extract_pyz_archives(output_dir: Path, pyc_magic: bytes | None):
-    for pyz_path in output_dir.rglob("*.pyz"):
+    pyz_files = list(output_dir.rglob("*.pyz"))
+    logger.debug(f"Found {len(pyz_files)} PYZ files")
+
+    for pyz_path in pyz_files:
         _extract_pyz(pyz_path, pyc_magic)
 
 
@@ -382,7 +374,8 @@ def _extract_pyz(pyz_path: Path, pyc_magic: bytes | None):
 
             try:
                 tbl = marshal.load(f)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"PYZ marshal failed: {e}")
                 return
 
             if not isinstance(tbl, (list, dict)):
@@ -396,6 +389,7 @@ def _extract_pyz(pyz_path: Path, pyc_magic: bytes | None):
             else:
                 entries = list(tbl.items())
 
+            written = 0
             for item in entries:
                 if isinstance(item, tuple) and len(item) >= 2:
                     name = item[0]
@@ -406,12 +400,11 @@ def _extract_pyz(pyz_path: Path, pyc_magic: bytes | None):
 
                     is_pkg = data_tuple[0]
                     offset = data_tuple[1]
-                    length = data_tuple[2]
 
                     if isinstance(name, bytes):
                         name = name.decode("utf-8", errors="replace")
 
-                    name = name.replace(".", os.path.sep)
+                    name = _sanitize_path(name.replace(".", os.path.sep))
 
                     if is_pkg == 1:
                         file_path = out_dir / name / "__init__.pyc"
@@ -425,10 +418,14 @@ def _extract_pyz(pyz_path: Path, pyc_magic: bytes | None):
                         data = f.read()
                         uncompressed = zlib.decompress(data)
                         _write_pyc(file_path, uncompressed, pyc_magic)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                        written += 1
+                    except Exception as e:
+                        logger.debug(f"PYZ entry failed ({name}): {e}")
+
+            logger.debug(f"PYZ: wrote {written} files")
+
+    except Exception as e:
+        logger.debug(f"PYZ extraction failed: {e}")
 
 
 def _write_pyc(path: Path, code_bytes: bytes, pyc_magic: bytes | None):
@@ -437,11 +434,9 @@ def _write_pyc(path: Path, code_bytes: bytes, pyc_magic: bytes | None):
 
     with open(path, "wb") as f:
         f.write(pyc_magic)
-
         f.write(b"\x00\x00\x00\x00")
         f.write(b"\x00\x00\x00\x00")
         f.write(b"\x00\x00\x00\x00")
-
         f.write(code_bytes)
 
 
