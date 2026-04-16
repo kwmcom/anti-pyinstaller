@@ -1,47 +1,20 @@
 # anti-pynstaller
 
-Zero-dependency PyInstaller executable extractor and disassembler.
-
-## Features
-
-- **Detect** - Identify PyInstaller binaries, show version, Python version, file count
-- **Extract** - Extract CArchive and PYZ contents with proper directory structure  
-- **Fix** - Reconstruct valid .pyc headers (8/12/16 byte variants)
-- **Disassemble** - Bytecode disassembly using Python's built-in `dis` module
-
-## Requirements
-
-- Python 3.12+
-- click (CLI only)
+PyInstaller extractor and disassembler.
 
 ## Install
 
 ```bash
-pip install --break-system-packages -e .
+pip install -e .
 ```
 
 ## Usage
 
 ```bash
-# Detect and show info
-anti-pynstaller detect myapp.exe
-
-# Extract archive
-anti-pynstaller extract myapp.exe
-
-# Disassemble directory
-anti-pynstaller disassemble extracted_dir/
-
-# Disassemble single file
-anti-pynstaller disassemble-one myapp.pyc
+anti-pynstaller detect file.exe     # Show info
+anti-pynstaller extract file.exe     # Extract archive
+anti-pynstaller disassemble dir/     # Disassemble all .pyc
+anti-pynstaller dis file.pyc         # Disassemble one .pyc
 ```
 
-## Design
-
-- Zero external dependencies (stdlib only + click)
-- Clean implementation - no code copied from references
-- Supports Windows .exe and Linux ELF
-
-## License
-
-MIT
+Zero dependencies (stdlib only).
