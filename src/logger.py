@@ -14,10 +14,14 @@ def debug(msg: str):
 
 
 def info(msg: str):
-    print(f"[INFO] {msg}")
+    print(f"[INFO] {msg")
 
 
 def warn(msg: str):
+    print(f"[WARN] {msg}", file=sys.stderr)
+
+
+def warning(msg: str):
     print(f"[WARN] {msg}", file=sys.stderr)
 
 

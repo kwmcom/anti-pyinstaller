@@ -237,7 +237,7 @@ def _parse_toc_info(
     while pos < len(toc_data):
         iterations += 1
         if iterations > MAX_TOC_ENTRIES:
-            logger.warn(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+            logger.warning(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
             break
 
         if pos + 4 > len(toc_data):

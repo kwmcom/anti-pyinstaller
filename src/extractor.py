@@ -78,7 +78,7 @@ def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResul
         output_dir = input_file.parent / f"{input_file.stem}_extracted"
 
     if output_dir.exists() and any(output_dir.iterdir()):
-        logger.warn(f"Output directory exists and is not empty: {output_dir}")
+        logger.warning(f"Output directory exists and is not empty: {output_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -226,7 +226,7 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
         logger.debug(f"Wrote {written} files")
 
         if encrypted:
-            logger.warn("Encrypted archive - some files may not extract")
+            logger.warning("Encrypted archive - some files may not extract")
 
         _extract_pyz_archives(output_dir, pyc_magic)
 
@@ -255,7 +255,7 @@ def _parse_toc_entries(
     while pos < len(toc_data):
         iterations += 1
         if iterations > MAX_TOC_ENTRIES:
-            logger.warn(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+            logger.warning(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
             break
 
         if pos + 4 > len(toc_data):
