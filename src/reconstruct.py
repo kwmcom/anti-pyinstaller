@@ -423,6 +423,10 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
             pass
 
         elif op == "IMPORT_NAME":
+            if stack:
+                stack.pop()
+            if stack:
+                stack.pop()
             if arg is not None and arg < len(code.co_names):
                 name = code.co_names[arg]
                 lines.append(f"import {name}")
