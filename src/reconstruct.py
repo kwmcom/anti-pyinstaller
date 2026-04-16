@@ -97,39 +97,86 @@ def _reconstruct_code(code: types.CodeType, indent: int = 0) -> str:
     lines = _process_instructions(instructions, code)
 
     for line in lines:
-        output.append(f"{prefix}{line}")
+        if line.strip():
+            output.append(f"{prefix}{line}")
 
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
             name = const.co_name
             if name not in ("<module>", "<lambda>", "__init__"):
                 output.append("")
-                output.append(_reconstruct_code(const, indent))
+                nested = _reconstruct_code(const, indent)
+                output.append(nested)
 
     return "\n".join(output)
 
 
 def _get_name(code: types.CodeType, arg: int | None, is_local: bool = True) -> str:
     if arg is None:
-        return "?"
+        return "_"
     if is_local:
         if arg < len(code.co_varnames):
             return code.co_varnames[arg]
-        return f"local_{arg}"
+        return f"var_{arg}"
     else:
         if arg < len(code.co_names):
             return code.co_names[arg]
         return f"name_{arg}"
 
 
-def _format_const(arg_repr: str) -> str:
-    if arg_repr in ("None", "Ellipsis"):
-        return arg_repr
-    if arg_repr == "True":
-        return "True"
-    if arg_repr == "False":
-        return "False"
-    return arg_repr
+def _format_const(code: types.CodeType, arg: int | None) -> str:
+    if arg is None or arg >= len(code.co_consts):
+        return "None"
+    c = code.co_consts[arg]
+    if c is None:
+        return "None"
+    if c is Ellipsis:
+        return "..."
+    if isinstance(c, bool):
+        return "True" if c else "False"
+    if isinstance(c, str):
+        if len(c) > 50:
+            return f"'{c[:50]}...'"
+        return f"'{c}'"
+    if isinstance(c, bytes):
+        return f"b'{c[:20].decode('utf-8', errors='replace')}...'"
+    if isinstance(c, (int, float)):
+        return str(c)
+    if isinstance(c, tuple):
+        items = [_format_const_item(x) for x in c]
+        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
+    if isinstance(c, list):
+        return "[]"
+    if isinstance(c, set):
+        return "set()"
+    if isinstance(c, dict):
+        return "{}"
+    if isinstance(c, types.CodeType):
+        return f"<function {c.co_name}>"
+    return repr(c)
+
+
+def _format_const_item(c) -> str:
+    if c is None:
+        return "None"
+    if c is Ellipsis:
+        return "..."
+    if isinstance(c, bool):
+        return "True" if c else "False"
+    if isinstance(c, str):
+        if len(c) > 30:
+            return f"'{c[:30]}...'"
+        return f"'{c}'"
+    if isinstance(c, bytes):
+        return "b'...'"
+    if isinstance(c, (int, float)):
+        return str(c)
+    if isinstance(c, tuple):
+        items = [_format_const_item(x) for x in c]
+        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
+    if isinstance(c, (list, dict, set)):
+        return "[]" if isinstance(c, list) else "{}"
+    return repr(c)
 
 
 def _process_instructions(instructions: list, code: types.CodeType) -> list[str]:
@@ -156,6 +203,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         "LIST_EXTEND",
         "SET_UPDATE",
         "MAP_ADD",
+        "CALL_KW",
     }
 
     def popn(n: int):
@@ -168,27 +216,13 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         instr = instructions[i]
         op = instr.opname
         arg = instr.arg
-        arg_repr = instr.argrepr
 
         if op in skip_ops:
             i += 1
             continue
 
         if op == "LOAD_CONST":
-            if arg_repr and arg_repr not in ("None", "Ellipsis", "True", "False"):
-                stack.append(_format_const(arg_repr))
-            elif arg is not None and arg < len(code.co_consts):
-                c = code.co_consts[arg]
-                if isinstance(c, str):
-                    stack.append(f"'{c}'")
-                elif isinstance(c, (int, float)):
-                    stack.append(str(c))
-                elif isinstance(c, bytes):
-                    stack.append(f"b'{c[:20].decode('utf-8', errors='replace')}...'")
-                else:
-                    stack.append(repr(c))
-            else:
-                stack.append("None")
+            stack.append(_format_const(code, arg))
 
         elif op == "LOAD_FAST":
             stack.append(_get_name(code, arg, True))
@@ -236,7 +270,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                 lines.append(f"del {name}")
 
         elif op == "CALL":
-            func = stack.pop() if stack else "?"
+            func = stack.pop() if stack else "_"
             args = popn(arg) if arg else []
             args_str = ", ".join(args) if args else ""
             lines.append(f"{func}({args_str})")
@@ -268,7 +302,6 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         elif op == "POP_JUMP_IF_FALSE":
             if stack:
                 cond = stack.pop()
-                target = arg if arg else 0
                 lines.append(f"if not {cond}:")
                 lines.append("    pass")
 
@@ -280,42 +313,34 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
 
         elif op == "FOR_ITER":
             if stack:
-                target = stack.pop() if stack else "iter"
+                target = stack.pop() if stack else "_"
                 lines.append(f"for _ in {target}:")
                 lines.append("    pass")
-
-        elif op == "GET_ITER":
-            pass
-
-        elif op == "JUMP_FORWARD":
-            pass
-
-        elif op == "JUMP_ABSOLUTE":
-            pass
 
         elif op == "BUILD_LIST":
             count = arg if arg else 0
             items = popn(count)
             if items:
-                lines.append(f"[{', '.join(items)}]")
                 stack.append(f"[{', '.join(items)}]")
             else:
-                lines.append("[]")
                 stack.append("[]")
 
         elif op == "BUILD_TUPLE":
             count = arg if arg else 0
             items = popn(count)
             if items:
-                lines.append(f"({', '.join(items)},)")
-                stack.append(f"({', '.join(items)},)")
+                s = ", ".join(items)
+                stack.append(f"({s},)" if len(items) == 1 else f"({s})")
+            else:
+                stack.append("()")
 
         elif op == "BUILD_SET":
             count = arg if arg else 0
             items = popn(count)
             if items:
-                lines.append(f"{{{', '.join(items)}}}")
                 stack.append(f"{{{', '.join(items)}}}")
+            else:
+                stack.append("set()")
 
         elif op == "BUILD_DICT":
             count = arg if arg else 0
@@ -324,13 +349,9 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
             for j in range(0, len(items), 2):
                 if j + 1 < len(items):
                     pairs.append(f"{items[j]}: {items[j + 1]}")
-                else:
-                    pairs.append(str(items[j]))
             if pairs:
-                lines.append(f"{{{', '.join(pairs)}}}")
                 stack.append(f"{{{', '.join(pairs)}}}")
             else:
-                lines.append("{}")
                 stack.append("{}")
 
         elif op == "BINARY_OP":
@@ -351,8 +372,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                     "|": "|",
                     "^": "^",
                 }
-                op_str = op_map.get(str(arg_repr), str(arg_repr) if arg_repr else "+")
-                stack.append(f"({a} {op_str} {b})")
+                stack.append(f"({a} {op_map.get(str(instr.argrepr), '+')} {b})")
 
         elif op == "BINARY_ADD":
             if len(stack) >= 2:
@@ -382,8 +402,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                     "is": "is",
                     "is not": "is not",
                 }
-                cmp_str = cmp_map.get(str(arg_repr), str(arg_repr) if arg_repr else "==")
-                stack.append(f"({a} {cmp_str} {b})")
+                stack.append(f"({a} {cmp_map.get(str(instr.argrepr), '==')} {b})")
 
         elif op == "UNARY_NEGATIVE":
             if stack:
@@ -401,7 +420,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                 stack.append(f"(not {val})")
 
         elif op == "MAKE_FUNCTION":
-            lines.append("# function defined")
+            pass
 
         elif op == "IMPORT_NAME":
             if arg is not None and arg < len(code.co_names):
@@ -411,7 +430,7 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         elif op == "IMPORT_FROM":
             if arg is not None and arg < len(code.co_names):
                 name = code.co_names[arg]
-                lines.append(f"from ... import {name}")
+                lines.append(f"# from ... import {name}")
 
         elif op == "LOAD_ATTR":
             if stack and arg is not None:
@@ -446,35 +465,21 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         elif op == "SUBSCR":
             if len(stack) >= 2:
                 idx = stack.pop()
-                obj = stack.pop() if stack else "?"
+                obj = stack.pop() if stack else "_"
                 stack.append(f"{obj}[{idx}]")
 
         elif op == "STORE_SUBSCR":
             if len(stack) >= 3:
                 val = stack.pop()
                 idx = stack.pop()
-                obj = stack.pop() if stack else "?"
+                obj = stack.pop() if stack else "_"
                 lines.append(f"{obj}[{idx}] = {val}")
 
         elif op == "DELETE_SUBSCR":
             if len(stack) >= 2:
                 idx = stack.pop()
-                obj = stack.pop() if stack else "?"
+                obj = stack.pop() if stack else "_"
                 lines.append(f"del {obj}[{idx}]")
-
-        elif op == "IS_OP":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                negate = "not " if arg else ""
-                stack.append(f"({negate}a is b)")
-
-        elif op == "CONTAINS_OP":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                negate = "not " if arg else ""
-                stack.append(f"({negate}a in b)")
 
         elif op in ("POP_TOP", "ROT_TWO", "ROT_THREE", "ROT_FOUR"):
             if stack:
