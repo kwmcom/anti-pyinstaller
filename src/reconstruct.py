@@ -79,22 +79,25 @@ def _detect_header_size(f) -> int:
     return 16 if file_size > 16 else 8
 
 
-def _reconstruct_code(code: types.CodeType, indent: int = 0) -> str:
+def _reconstruct_code(code: types.CodeType, indent: int = 0, is_class: bool = False) -> str:
     output = []
     prefix = "    " * indent
     is_main = code.co_name == "<module>"
 
     if not is_main:
-        args = list(code.co_varnames[: code.co_argcount])
-        kwonly = code.co_kwonlyargcount
-        if kwonly:
-            args.append("*")
-            args.extend(code.co_varnames[code.co_argcount : code.co_argcount + kwonly])
-        args_str = ", ".join(args) if args else ""
-        output.append(f"def {code.co_name}({args_str}):")
+        if is_class:
+            output.append(f"class {code.co_name}:")
+        else:
+            args = list(code.co_varnames[: code.co_argcount])
+            kwonly = code.co_kwonlyargcount
+            if kwonly:
+                args.append("*")
+                args.extend(code.co_varnames[code.co_argcount : code.co_argcount + kwonly])
+            args_str = ", ".join(args) if args else ""
+            output.append(f"def {code.co_name}({args_str}):")
 
     instructions = list(dis.get_instructions(code))
-    lines = _process_instructions(instructions, code)
+    lines = _process_instructions(instructions, code, is_main)
 
     for line in lines:
         if line.strip():
@@ -104,11 +107,21 @@ def _reconstruct_code(code: types.CodeType, indent: int = 0) -> str:
         if isinstance(const, types.CodeType):
             name = const.co_name
             if name not in ("<module>", "<lambda>", "__init__"):
+                is_class_method = _is_class_method(const, code)
                 output.append("")
-                nested = _reconstruct_code(const, indent)
+                nested = _reconstruct_code(const, indent, is_class_method)
                 output.append(nested)
 
     return "\n".join(output)
+
+
+def _is_class_method(nested_code: types.CodeType, parent_code: types.CodeType) -> bool:
+    for instr in dis.get_instructions(parent_code):
+        if instr.opname == "MAKE_CLASS" and isinstance(instr.argrepr, str):
+            for const in parent_code.co_consts:
+                if isinstance(const, types.CodeType) and const.co_name == nested_code.co_name:
+                    return True
+    return False
 
 
 def _get_name(code: types.CodeType, arg: int | None, is_local: bool = True) -> str:
@@ -179,7 +192,7 @@ def _format_const_item(c) -> str:
     return repr(c)
 
 
-def _process_instructions(instructions: list, code: types.CodeType) -> list[str]:
+def _process_instructions(instructions: list, code: types.CodeType, is_main: bool) -> list[str]:
     lines = []
     stack = []
     i = 0
@@ -204,6 +217,18 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
         "SET_UPDATE",
         "MAP_ADD",
         "CALL_KW",
+        "SETUP_FINALLY",
+        "WITH_EXCEPT_START",
+        "END_FINALLY",
+    }
+
+    internal_attrs = {
+        "__module__",
+        "__qualname__",
+        "__doc__",
+        "__class__",
+        "__dict__",
+        "__weakref__",
     }
 
     def popn(n: int):
@@ -244,13 +269,15 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
             if stack and arg is not None:
                 val = stack.pop()
                 name = _get_name(code, arg, True)
-                lines.append(f"{name} = {val}")
+                if name not in internal_attrs:
+                    lines.append(f"{name} = {val}")
 
         elif op == "STORE_NAME":
             if stack and arg is not None:
                 val = stack.pop()
                 name = _get_name(code, arg, False)
-                lines.append(f"{name} = {val}")
+                if name not in internal_attrs:
+                    lines.append(f"{name} = {val}")
 
         elif op == "STORE_GLOBAL":
             if stack and arg is not None:
@@ -270,18 +297,26 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                 lines.append(f"del {name}")
 
         elif op == "CALL":
-            func = stack.pop() if stack else "_"
-            args = popn(arg) if arg else []
-            args_str = ", ".join(args) if args else ""
-            lines.append(f"{func}({args_str})")
-            stack.clear()
+            if stack:
+                func = stack.pop()
+                args = popn(arg) if arg else []
+                args_str = ", ".join(args) if args else ""
+
+                if func.startswith("'") and func.endswith("'"):
+                    name = func.strip("'")
+                    lines.append(f"# class {name}({args_str})")
+                else:
+                    lines.append(f"{func}({args_str})")
+                stack.clear()
 
         elif op == "RETURN_VALUE":
             if stack:
                 val = stack.pop()
-                lines.append(f"return {val}")
+                if val != "None" or is_main:
+                    lines.append(f"return {val}")
             else:
                 lines.append("return")
+            break
 
         elif op == "RAISE_VARARGS":
             if arg and arg > 0 and stack:
@@ -420,7 +455,10 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                 stack.append(f"(not {val})")
 
         elif op == "MAKE_FUNCTION":
-            pass
+            if stack:
+                stack.pop()
+            if arg is not None and arg > 0:
+                pass
 
         elif op == "IMPORT_NAME":
             if stack:
@@ -432,9 +470,11 @@ def _process_instructions(instructions: list, code: types.CodeType) -> list[str]
                 lines.append(f"import {name}")
 
         elif op == "IMPORT_FROM":
+            if stack:
+                stack.pop()
             if arg is not None and arg < len(code.co_names):
                 name = code.co_names[arg]
-                lines.append(f"# from ... import {name}")
+                lines.append(f"from ... import {name}")
 
         elif op == "LOAD_ATTR":
             if stack and arg is not None:
