@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from src import detector, disasm, extractor, pyc_fixer, logger
+from src import detector, disasm, extractor, pyc_fixer, logger, reconstruct
 
 
 def main():
@@ -12,7 +12,7 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage: anti-pyinstaller <command> <args>")
-        print("Commands: detect, extract, disassemble, dis")
+        print("Commands: detect, extract, disassemble, dis, pseudo")
         print("Options: -v, --verbose")
         sys.exit(1)
 
@@ -64,6 +64,19 @@ def main():
         result = disasm.disassemble(file)
         if result.success:
             print(f"Written to {result.output_path}")
+        else:
+            logger.error(result.message)
+            sys.exit(1)
+
+    elif cmd in ("pseudo", "reconstruct"):
+        if len(sys.argv) < 3:
+            print("Usage: pseudo <file.pyc>")
+            sys.exit(1)
+        file = Path(sys.argv[2])
+        pyc_fixer.fix_pyc(file)
+        result = reconstruct.reconstruct(file)
+        if result.success:
+            print(f"Reconstructed to {result.output_path}")
         else:
             logger.error(result.message)
             sys.exit(1)

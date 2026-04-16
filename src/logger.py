@@ -14,7 +14,7 @@ def debug(msg: str):
 
 
 def info(msg: str):
-    print(f"[INFO] {msg")
+    print(f"[INFO] {msg}")
 
 
 def warn(msg: str):
