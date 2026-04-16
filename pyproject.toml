@@ -1,6 +1,6 @@
 [project]
 name = "anti-pyinstaller"
-version = "0.1.0"
+version = "1.1.5"
 description = "PyInstaller extractor and disassembler"
 authors = [{name = "anti-pyinstaller"}]
 readme = "README.md"
