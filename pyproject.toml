@@ -1,7 +1,7 @@
 [project]
 name = "anti-pyinstaller"
-version = "1.4"
-description = "PyInstaller extractor and disassembler - pseudo-reconstruction code"
+version = "1.5"
+description = "PyInstaller extractor and disassembler"
 authors = [{name = "anti-pyinstaller"}]
 readme = "README.md"
 requires-python = ">=3.12"
