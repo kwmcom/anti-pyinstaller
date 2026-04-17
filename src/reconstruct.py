@@ -60,6 +60,14 @@ class BasicBlock:
     predecessors: list["BasicBlock"] = field(default_factory=list)
     except_edges: list["BasicBlock"] = field(default_factory=list)  # For TRY blocks
 
+    def __hash__(self) -> int:
+        return hash(self.start_offset)
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, BasicBlock):
+            return False
+        return self.start_offset == other.start_offset
+
     @property
     def end_offset(self) -> int:
         if self.instructions:
@@ -74,6 +82,81 @@ class BasicBlock:
         return last_op in ("RETURN_VALUE", "RAISE_VARARGS")
 
 
+class CFGValidator:
+    """Validates CFG for structural correctness before interpretation."""
+
+    @staticmethod
+    def validate(blocks: list[BasicBlock]) -> tuple[bool, list[str], float]:
+        """Validate CFG, return (is_valid, warnings, confidence_score)."""
+        warnings = []
+        confidence = 1.0
+
+        # Check 1: All blocks have valid terminators
+        for block in blocks:
+            if not block.instructions:
+                warnings.append(f"Block@{block.start_offset}: empty block")
+                confidence -= 0.05
+                continue
+
+            last_op = block.instructions[-1].opname
+            # Each block must end with terminator or have successors
+            if last_op not in ("RETURN_VALUE", "RAISE_VARARGS",
+                              "JUMP_ABSOLUTE", "JUMP_FORWARD",
+                              "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+                              "FOR_ITER"):
+                if not block.successors:
+                    # Implicit fallthrough - OK if next block exists
+                    pass
+
+        # Check 2: Edge consistency
+        for block in blocks:
+            for succ in block.successors:
+                if block not in succ.predecessors:
+                    warnings.append(f"Block@{block.start_offset}: inconsistent edge to Block@{succ.start_offset}")
+                    confidence -= 0.1
+
+        # Check 3: Reachability
+        # All blocks should be reachable from entry (offset 0)
+        entry = None
+        for b in blocks:
+            if b.start_offset == 0:
+                entry = b
+                break
+
+        if entry:
+            reachable = CFGValidator._find_reachable(entry)
+            unreachable = set(blocks) - reachable
+            if unreachable:
+                warnings.append(f"{len(unreachable)} unreachable blocks detected")
+                confidence -= 0.1 * len(unreachable)
+
+        # Check 4: No overlapping blocks
+        covered_offsets = set()
+        for block in blocks:
+            for instr in block.instructions:
+                if instr.offset in covered_offsets:
+                    warnings.append(f"Duplicate coverage at offset {instr.offset}")
+                    confidence -= 0.2
+                covered_offsets.add(instr.offset)
+
+        is_valid = confidence > 0.5
+        return is_valid, warnings, max(0.0, confidence)
+
+    @staticmethod
+    def _find_reachable(start: BasicBlock) -> set[BasicBlock]:
+        """Find all reachable blocks from start via DFS."""
+        reachable = set()
+        stack = [start]
+        while stack:
+            block = stack.pop()
+            if block in reachable:
+                continue
+            reachable.add(block)
+            for succ in block.successors:
+                stack.append(succ)
+        return reachable
+
+
 class CFGBuilder:
     """Builds control flow graph from bytecode."""
 
@@ -86,8 +169,8 @@ class CFGBuilder:
         for i, instr in enumerate(self.instructions):
             self.offset_to_idx[instr.offset] = i
 
-    def build(self) -> list[BasicBlock]:
-        """Build CFG and return list of blocks."""
+    def build(self) -> tuple[list[BasicBlock], list[str], float]:
+        """Build CFG and return (blocks, warnings, confidence)."""
         # Step 1: Find all block leaders (entry points)
         leaders = self._find_block_leaders()
 
@@ -97,7 +180,15 @@ class CFGBuilder:
         # Step 3: Connect edges (successors)
         self._connect_edges()
 
-        return list(self.blocks.values())
+        blocks = list(self.blocks.values())
+
+        # Step 4: Validate
+        is_valid, warnings, confidence = CFGValidator.validate(blocks)
+
+        if not is_valid:
+            warnings.insert(0, f"CFG validation failed (confidence={confidence:.2f})")
+
+        return blocks, warnings, confidence
 
     def _find_block_leaders(self) -> set[int]:
         """Find all instruction offsets that start a new block."""
@@ -446,8 +537,10 @@ def _build_function_from_scope(scope: dict) -> IRNode:
         if child_node:
             func_node.children.append(child_node)
 
-    # Build function body
-    func_node.body = _extract_function_body(code)
+    # Build function body with validation
+    body, warnings, confidence = _extract_function_body(code)
+    func_node.body = body
+    # Could store warnings/confidence in node if we extend IRNode
 
     return func_node
 
@@ -600,8 +693,9 @@ def _build_function_ir(code: types.CodeType, decorators: list = None) -> IRNode:
         else:
             func_node.children.append(_build_function_ir(def_info["code"]))
 
-    # Extract function body
-    func_node.body = _extract_function_body(code)
+    # Extract function body with validation
+    body, warnings, confidence = _extract_function_body(code)
+    func_node.body = body
 
     return func_node
 
@@ -656,18 +750,362 @@ def _build_class_ir(code: types.CodeType, name: str, decorators: list = None) ->
     return class_node
 
 
-def _extract_function_body(code: types.CodeType) -> list[str]:
-    """Extract function body statements from bytecode."""
-    instructions = list(dis.get_instructions(code))
-    emitter = BytecodeEmitter(code)
+def _extract_function_body(code: types.CodeType) -> tuple[list[str], list[str], float]:
+    """Extract function body from CFG (structured, not linear).
 
-    for i, instr in enumerate(instructions):
-        # Skip RESUME at the start
-        if i == 0 and instr.opname == "RESUME":
-            continue
-        emitter.process(instr)
+    Returns: (statements, warnings, confidence_score)
+    """
+    # Build CFG first
+    builder = CFGBuilder(code)
+    blocks, warnings, confidence = builder.build()
 
-    return emitter.get_statements()
+    if not blocks:
+        return ["pass"], ["CFG: no blocks generated"], 0.0
+
+    if confidence < 0.5:
+        # Low confidence - emit pseudo-IR, not Python
+        return (
+            [f"# CFG incomplete (confidence={confidence:.2f})", "pass"],
+            warnings + ["Confidence below threshold, emitted placeholder"],
+            confidence
+        )
+
+    # Build expression evaluator for each block
+    evaluator = BlockEvaluator(code)
+
+    # Find entry block (starts at offset 0)
+    entry = None
+    for block in blocks:
+        if block.start_offset == 0 or (block.instructions and block.instructions[0].opname == "RESUME"):
+            entry = block
+            break
+    if entry is None:
+        entry = min(blocks, key=lambda b: b.start_offset)
+
+    # Emit body from structured traversal
+    stmts = _emit_cfg_body(entry, evaluator, set())
+
+    # Combine evaluator confidence with CFG confidence
+    total_confidence = confidence * evaluator.get_confidence()
+
+    return stmts, warnings, total_confidence
+
+
+def _emit_cfg_body(block: BasicBlock, evaluator: "BlockEvaluator", visited: set) -> list[str]:
+    """Emit body from CFG traversal, handling branches."""
+    if block.start_offset in visited:
+        return ["# (merge block)"]
+    visited.add(block.start_offset)
+
+    result = []
+
+    # Evaluate this block (expressions only, no control flow)
+    block_statements = evaluator.evaluate_block(block)
+    result.extend(block_statements)
+
+    # Handle successors
+    if len(block.successors) == 0:
+        # No successors (return/raise) - done
+        pass
+    elif len(block.successors) == 1:
+        # Fallthrough - continue to next block
+        succ = block.successors[0]
+        if not block.is_terminator:
+            result.extend(_emit_cfg_body(succ, evaluator, visited))
+    elif len(block.successors) == 2:
+        # Conditional - emit if/else
+        # Determine if this is if/else or if-only
+        true_block, false_block = _classify_branches(block, block.successors[0], block.successors[1])
+
+        # Get condition from last conditional instruction
+        condition = evaluator.get_last_condition()
+
+        if condition:
+            result.append(f"if {condition}:")
+            # True branch
+            true_body = _emit_cfg_body(true_block, evaluator.copy(), visited.copy())
+            for stmt in true_body:
+                result.append(f"    {stmt}")
+
+            # Check if false branch has content
+            false_body = _emit_cfg_body(false_block, evaluator.copy(), visited.copy())
+            if false_body and any(s.strip() and not s.startswith("#") for s in false_body):
+                result.append("else:")
+                for stmt in false_body:
+                    result.append(f"    {stmt}")
+    # else: more than 2 successors (switch) - not handling
+
+    return result if result else ["pass"]
+
+
+def _classify_branches(block: BasicBlock, succ1: BasicBlock, succ2: BasicBlock) -> tuple:
+    """Classify which successor is true/false branch."""
+    if not block.instructions:
+        return succ1, succ2
+
+    last_instr = block.instructions[-1]
+    op = last_instr.opname
+
+    # For POP_JUMP_IF_FALSE: target is jump_target (false branch), fallthrough is true
+    # For POP_JUMP_IF_TRUE: target is jump_target (true branch), fallthrough is false
+    if hasattr(last_instr, 'jump_target') and last_instr.jump_target is not None:
+        jump_target = last_instr.jump_target
+        # Find which successor matches jump target
+        if succ1.start_offset == jump_target:
+            jump_succ = succ1
+            fall_succ = succ2
+        else:
+            jump_succ = succ2
+            fall_succ = succ1
+
+        if op in ("POP_JUMP_IF_FALSE",):
+            # Jump if false, so fallthrough is true
+            return fall_succ, jump_succ
+        elif op in ("POP_JUMP_IF_TRUE",):
+            # Jump if true
+            return jump_succ, fall_succ
+
+    return succ1, succ2
+
+
+class BlockEvaluator:
+    """Evaluates expressions within a single basic block (no control flow).
+
+    Strict mode: no guessing, emit UNKNOWN_EXPRESSION on underflow.
+    """
+
+    UNKNOWN_EXPR = "UNKNOWN_EXPR"
+
+    def __init__(self, code: types.CodeType):
+        self.code = code
+        self.stack: list[str] = []
+        self.current_condition: str | None = None
+        self.unknown_count = 0  # Track how many unknowns we emit
+
+    def copy(self) -> "BlockEvaluator":
+        new = BlockEvaluator(self.code)
+        new.stack = self.stack.copy()
+        return new
+
+    def get_last_condition(self) -> str | None:
+        return self.current_condition
+
+    def evaluate_block(self, block: BasicBlock) -> list[str]:
+        """Evaluate a block, return statements."""
+        statements = []
+        self.stack = []  # Fresh stack per block
+
+        for instr in block.instructions:
+            stmt = self._eval_instruction(instr)
+            if stmt is not None:
+                statements.append(stmt)
+
+        return statements
+
+    def _eval_instruction(self, instr) -> str | None:
+        """Evaluate single instruction, return statement if any."""
+        op = instr.opname
+        arg = instr.arg
+
+        # Skip structural opcodes
+        if op in ("RESUME", "CACHE", "NOP", "NOT_TAKEN"):
+            return None
+
+        # Skip control flow (handled by CFG traversal)
+        if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+                  "JUMP_ABSOLUTE", "JUMP_FORWARD", "FOR_ITER"):
+            # Capture last conditional for if/else
+            if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE") and self.stack:
+                self.current_condition = self.stack.pop()
+            return None
+
+        # Skip returns/raises (block terminators)
+        if op in ("RETURN_VALUE", "RAISE_VARARGS"):
+            if op == "RETURN_VALUE" and self.stack:
+                val = self.stack.pop()
+                if val != "None":
+                    return f"return {val}"
+                return "return"
+            if op == "RAISE_VARARGS" and self.stack:
+                exc = self.stack.pop()
+                return f"raise {exc}"
+            return None
+
+        # Load operations (push onto stack)
+        if op == "LOAD_CONST":
+            self.stack.append(self._format_const(arg))
+            return None
+
+        if op in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+            self.stack.append(self._get_varname(arg))
+            return None
+
+        if op in ("LOAD_NAME", "LOAD_GLOBAL"):
+            self.stack.append(self._get_name(arg))
+            return None
+
+        if op == "LOAD_ATTR" and self.stack:
+            obj = self.stack.pop()
+            attr = self._get_name(arg)
+            self.stack.append(f"{obj}.{attr}")
+            return None
+
+        # Store operations (pop from stack, emit statement)
+        if op in ("STORE_FAST", "STORE_NAME", "STORE_GLOBAL"):
+            if self.stack:
+                val = self.stack.pop()
+                name = self._get_varname(arg) if op == "STORE_FAST" else self._get_name(arg)
+                if name and not name.startswith("__"):
+                    return f"{name} = {val}"
+            return None
+
+        if op == "STORE_SUBSCR" and len(self.stack) >= 3:
+            val = self.stack.pop()  # TOS
+            idx = self.stack.pop()  # TOS1
+            obj = self.stack.pop()  # TOS2
+            return f"{obj}[{idx}] = {val}"
+
+        # Call operations
+        if op in ("CALL", "CALL_FUNCTION"):
+            return self._emit_call(arg)
+
+        # Binary operations
+        if op == "BINARY_OP" and len(self.stack) >= 2:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            ops = {0: "+", 1: "-", 2: "*", 3: "/", 4: "//", 5: "%",
+                   6: "@", 7: "**", 8: ">>", 9: "<<", 10: "&", 11: "^", 12: "|"}
+            self.stack.append(f"({left} {ops.get(arg, '+')} {right})")
+            return None
+
+        if op == "COMPARE_OP" and len(self.stack) >= 2:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            cmps = {0: "<", 1: "<=", 2: "==", 3: "!=", 4: ">", 5: ">=",
+                    8: "is", 9: "is not", 10: "in", 11: "not in"}
+            self.stack.append(f"({left} {cmps.get(arg, '==')} {right})")
+            return None
+
+        if op == "CONTAINS_OP" and len(self.stack) >= 2:
+            obj = self.stack.pop()
+            container = self.stack.pop()
+            if arg == 1:
+                self.stack.append(f"{obj} not in {container}")
+            else:
+                self.stack.append(f"{obj} in {container}")
+            return None
+
+        if op == "BUILD_TUPLE":
+            items = []
+            for _ in range(min(arg, len(self.stack))):
+                items.insert(0, self.stack.pop())
+            if len(items) == 1:
+                self.stack.append(f"({items[0]},)")
+            else:
+                self.stack.append(f"({', '.join(items)})")
+            return None
+
+        if op == "BUILD_LIST":
+            items = []
+            for _ in range(min(arg, len(self.stack))):
+                items.insert(0, self.stack.pop())
+            self.stack.append(f"[{', '.join(items)}]")
+            return None
+
+        if op == "BUILD_DICT":
+            pairs = []
+            for _ in range(min(arg, len(self.stack) // 2)):
+                if len(self.stack) >= 2:
+                    v = self.stack.pop()
+                    k = self.stack.pop()
+                    pairs.insert(0, f"{k}: {v}")
+            self.stack.append(f"{{{', '.join(pairs)}}}")
+            return None
+
+        # Binary subscript (load)
+        if op in ("BINARY_SUBSCR", "SUBSCR") and len(self.stack) >= 2:
+            idx = self.stack.pop()
+            obj = self.stack.pop()
+            self.stack.append(f"{obj}[{idx}]")
+            return None
+
+        # POP_TOP - discard top of stack
+        if op == "POP_TOP" and self.stack:
+            self.stack.pop()
+            return None
+
+        # Unknown opcode - mark as unknown expression
+        self.unknown_count += 1
+        self.stack.append(f"OP_{op}_{arg}")
+        return None
+
+    def _emit_call(self, argc: int | None) -> str | None:
+        """Emit function call - strict stack validation."""
+        if argc is None:
+            argc = 0
+
+        # Require: argc args + 1 function
+        required = argc + 1
+        if len(self.stack) < required:
+            # Stack underflow - punt
+            self.stack.append(f"UNKNOWN_CALL(argc={argc})")
+            return None
+
+        args = []
+        for _ in range(argc):
+            args.insert(0, self.stack.pop())
+
+        func = self.stack.pop()
+        if " + NULL" in func:
+            func = func.split(" + NULL")[0]
+        if " + NULL|" in func:
+            func = func.split(" + NULL|")[0]
+
+        self.stack.append(f"{func}({', '.join(args)})")
+        return None
+
+    def _format_const(self, arg: int | None) -> str:
+        if arg is None or arg >= len(self.code.co_consts):
+            return "None"
+        c = self.code.co_consts[arg]
+        if c is None:
+            return "None"
+        if isinstance(c, bool):
+            return "True" if c else "False"
+        if isinstance(c, str):
+            escaped = c.replace("'", "\\'").replace("\\", "\\\\")
+            return f"'{escaped}'"
+        if isinstance(c, (int, float)):
+            return str(c)
+        if isinstance(c, tuple):
+            items = [repr(x) if isinstance(x, (int, str, float, bool)) else str(x) for x in c]
+            return f"({', '.join(items)})" if len(c) != 1 else f"({items[0]},)"
+        return repr(c)[:50]
+
+    def _get_varname(self, arg: int | None) -> str:
+        if arg is None:
+            return "_"
+        if arg < len(self.code.co_varnames):
+            return self.code.co_varnames[arg]
+        return f"var_{arg}"
+
+    def _get_name(self, arg: int | None) -> str:
+        if arg is None:
+            return "_"
+        idx = arg >> 1 if arg else arg
+        if idx is not None and idx < len(self.code.co_names):
+            return self.code.co_names[idx]
+        if arg < len(self.code.co_names):
+            return self.code.co_names[arg]
+        return f"name_{arg}"
+
+    def get_confidence(self) -> float:
+        """Calculate confidence score based on unknowns."""
+        # Simple heuristic: more unknowns = lower confidence
+        if self.unknown_count == 0:
+            return 1.0
+        # Cap at some minimum
+        return max(0.3, 1.0 - (self.unknown_count * 0.1))
 
 
 class BytecodeEmitter:
