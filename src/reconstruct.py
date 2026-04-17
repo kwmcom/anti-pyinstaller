@@ -2,8 +2,27 @@ import dis
 import marshal
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from enum import Enum, auto
+
+
+class IRType(Enum):
+    MODULE = auto()
+    CLASS = auto()
+    FUNCTION = auto()
+
+
+@dataclass
+class IRNode:
+    name: str
+    ir_type: IRType
+    code: types.CodeType | None = None
+    args: list[str] = field(default_factory=list)
+    defaults: list = field(default_factory=list)
+    body: list[str] = field(default_factory=list)
+    children: list["IRNode"] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -33,10 +52,8 @@ def reconstruct(pyc_path: Path, output_path: Path | None = None) -> ReconstructR
             if not isinstance(code_obj, types.CodeType):
                 return ReconstructResult(False, None, "Not a valid code object")
 
-        try:
-            output = _reconstruct_code(code_obj)
-        except Exception as e:
-            return ReconstructResult(False, None, f"Reconstruction failed: {e}")
+        ir = _build_ir(code_obj)
+        output = _emit_ir(ir)
 
         if output_path is None:
             output_path = pyc_path.with_suffix(".py")
@@ -79,123 +96,217 @@ def _detect_header_size(f) -> int:
     return 16 if file_size > 16 else 8
 
 
-def _reconstruct_code(code: types.CodeType, indent: int = 0, is_class: bool = False) -> str:
-    output = []
-    prefix = "    " * indent
-    is_main = code.co_name == "<module>"
-
-    if not is_main:
-        if is_class:
-            output.append(f"class {code.co_name}:")
-        else:
-            args = list(code.co_varnames[: code.co_argcount])
-            kwonly = code.co_kwonlyargcount
-            if kwonly:
-                args.append("*")
-                args.extend(code.co_varnames[code.co_argcount : code.co_argcount + kwonly])
-            args_str = ", ".join(args) if args else ""
-            output.append(f"def {code.co_name}({args_str}):")
-
+def _build_ir(code: types.CodeType) -> IRNode:
     instructions = list(dis.get_instructions(code))
-    lines = _process_instructions(instructions, code, is_main)
 
-    for line in lines:
-        if line.strip():
-            output.append(f"{prefix}{line}")
+    module = IRNode(name="<module>", ir_type=IRType.MODULE, code=code)
+    module.imports = _extract_imports(code)
+
+    module_defs = _extract_module_definitions(code, instructions)
+
+    for def_type, def_name, def_code in module_defs:
+        if def_type == "class":
+            class_node = _build_class_ir(def_code, def_name)
+            module.children.append(class_node)
+        else:
+            func_node = _build_function_ir(def_code)
+            module.children.append(func_node)
+
+    return module
+
+
+def _extract_module_definitions(code: types.CodeType, instructions: list):
+    definitions = []
+    pending_class = None
+    pending_func = None
+
+    skip_names = {
+        "__init__",
+        "__annotate__",
+        "__static_attributes__",
+        "__annotate_func__",
+        "__classdictcell__",
+    }
+
+    i = 0
+    while i < len(instructions):
+        instr = instructions[i]
+        op = instr.opname
+
+        if op == "LOAD_BUILD_CLASS":
+            pending_class = True
+
+        elif op == "MAKE_FUNCTION":
+            pending_func = True
+
+        elif op == "STORE_NAME":
+            arg = instr.arg
+            if arg is not None and arg < len(code.co_names):
+                name = code.co_names[arg]
+                if name in skip_names:
+                    i += 1
+                    continue
+
+                if pending_class:
+                    for const in code.co_consts:
+                        if isinstance(const, types.CodeType):
+                            class_name = _get_class_name(const, code)
+                            if class_name == name and _is_class_definition(const):
+                                definitions.append(("class", name, const))
+                                pending_class = None
+                                break
+
+                elif pending_func:
+                    for const in code.co_consts:
+                        if isinstance(const, types.CodeType):
+                            if const.co_name == name and not _is_class_definition(const):
+                                definitions.append(("function", name, const))
+                                pending_func = None
+                                break
+
+        i += 1
+
+    return definitions
+
+
+def _extract_imports(code: types.CodeType) -> list[str]:
+    imports = []
+    current_module = None
+    from_names = []
+    seen = set()
+
+    for instr in dis.get_instructions(code):
+        if instr.opname == "IMPORT_NAME":
+            if instr.arg is not None and instr.arg < len(code.co_names):
+                current_module = code.co_names[instr.arg]
+
+                next_instr = None
+                try:
+                    idx = list(dis.get_instructions(code)).index(instr)
+                    all_instrs = list(dis.get_instructions(code))
+                    if idx + 1 < len(all_instrs):
+                        next_instr = all_instrs[idx + 1].opname
+                except:
+                    pass
+
+                if next_instr != "IMPORT_FROM":
+                    if current_module not in seen and not current_module.startswith("_"):
+                        imports.append(f"import {current_module}")
+                        seen.add(current_module)
+
+                from_names = []
+
+        elif instr.opname == "IMPORT_FROM":
+            if instr.arg is not None and instr.arg < len(code.co_names):
+                name = code.co_names[instr.arg]
+                from_names.append(name)
+
+        elif instr.opname == "STORE_NAME":
+            if current_module and from_names:
+                if current_module not in seen and not current_module.startswith("_"):
+                    import_str = f"from {current_module} import {', '.join(from_names)}"
+                    imports.append(import_str)
+                    seen.add(current_module)
+
+            current_module = None
+            from_names = []
+
+    return imports
+
+
+def _extract_nested_definitions(code: types.CodeType):
+    functions = []
+    classes = []
 
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
-            name = const.co_name
-            if name not in ("<module>", "<lambda>", "__init__"):
-                is_class_method = _is_class_method(const, code)
-                output.append("")
-                nested = _reconstruct_code(const, indent, is_class_method)
-                output.append(nested)
+            if const.co_name not in ("<module>", "<lambda>", "__init__"):
+                if const.co_name not in (
+                    "__annotate__",
+                    "__static_attributes__",
+                    "__annotate_func__",
+                ):
+                    if _is_class_definition(const):
+                        class_name = _get_class_name(const, code)
+                        if class_name:
+                            classes.append((const, class_name))
+                    else:
+                        functions.append(const)
 
-    return "\n".join(output)
+    return functions, classes
 
 
-def _is_class_method(nested_code: types.CodeType, parent_code: types.CodeType) -> bool:
-    for instr in dis.get_instructions(parent_code):
-        if instr.opname == "MAKE_CLASS" and isinstance(instr.argrepr, str):
-            for const in parent_code.co_consts:
-                if isinstance(const, types.CodeType) and const.co_name == nested_code.co_name:
-                    return True
+def _is_class_definition(nested_code: types.CodeType) -> bool:
+    instructions = list(dis.get_instructions(nested_code))
+    if instructions and instructions[0].opname == "MAKE_CELL":
+        return True
     return False
 
 
-def _get_name(code: types.CodeType, arg: int | None, is_local: bool = True) -> str:
-    if arg is None:
-        return "_"
-    if is_local:
-        if arg < len(code.co_varnames):
-            return code.co_varnames[arg]
-        return f"var_{arg}"
-    else:
-        if arg < len(code.co_names):
-            return code.co_names[arg]
-        return f"name_{arg}"
+def _get_class_name(class_code: types.CodeType, parent_code: types.CodeType) -> str | None:
+    for i, const in enumerate(parent_code.co_consts):
+        if const is class_code:
+            if i + 1 < len(parent_code.co_consts):
+                next_const = parent_code.co_consts[i + 1]
+                if isinstance(next_const, str):
+                    return next_const
+    return class_code.co_name
 
 
-def _format_const(code: types.CodeType, arg: int | None) -> str:
-    if arg is None or arg >= len(code.co_consts):
-        return "None"
-    c = code.co_consts[arg]
-    if c is None:
-        return "None"
-    if c is Ellipsis:
-        return "..."
-    if isinstance(c, bool):
-        return "True" if c else "False"
-    if isinstance(c, str):
-        if len(c) > 50:
-            return f"'{c[:50]}...'"
-        return f"'{c}'"
-    if isinstance(c, bytes):
-        return f"b'{c[:20].decode('utf-8', errors='replace')}...'"
-    if isinstance(c, (int, float)):
-        return str(c)
-    if isinstance(c, tuple):
-        items = [_format_const_item(x) for x in c]
-        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
-    if isinstance(c, list):
-        return "[]"
-    if isinstance(c, set):
-        return "set()"
-    if isinstance(c, dict):
-        return "{}"
-    if isinstance(c, types.CodeType):
-        return f"<function {c.co_name}>"
-    return repr(c)
+def _build_function_ir(code: types.CodeType) -> IRNode:
+    args = list(code.co_varnames[: code.co_argcount])
+    kwonly = code.co_kwonlyargcount
+    if kwonly:
+        args.append("*")
+        args.extend(code.co_varnames[code.co_argcount : code.co_argcount + kwonly])
+
+    func_node = IRNode(
+        name=code.co_name,
+        ir_type=IRType.FUNCTION,
+        code=code,
+        args=args,
+    )
+
+    func_defs, class_defs = _extract_nested_definitions(code)
+    for func_code in func_defs:
+        func_node.children.append(_build_function_ir(func_code))
+
+    for class_code, class_name in class_defs:
+        func_node.children.append(_build_class_ir(class_code, class_name))
+
+    func_node.body = _extract_body_instructions(code, list(dis.get_instructions(code)))
+
+    return func_node
 
 
-def _format_const_item(c) -> str:
-    if c is None:
-        return "None"
-    if c is Ellipsis:
-        return "..."
-    if isinstance(c, bool):
-        return "True" if c else "False"
-    if isinstance(c, str):
-        if len(c) > 30:
-            return f"'{c[:30]}...'"
-        return f"'{c}'"
-    if isinstance(c, bytes):
-        return "b'...'"
-    if isinstance(c, (int, float)):
-        return str(c)
-    if isinstance(c, tuple):
-        items = [_format_const_item(x) for x in c]
-        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
-    if isinstance(c, (list, dict, set)):
-        return "[]" if isinstance(c, list) else "{}"
-    return repr(c)
+def _build_class_ir(code: types.CodeType, name: str) -> IRNode:
+    class_node = IRNode(
+        name=name,
+        ir_type=IRType.CLASS,
+        code=code,
+    )
+
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            if const.co_name not in (
+                "<module>",
+                "<lambda>",
+                "__init__",
+                "__annotate__",
+                "__static_attributes__",
+                "__annotate_func__",
+            ):
+                func_node = _build_function_ir(const)
+                class_node.children.append(func_node)
+
+    class_node.body = []
+
+    return class_node
 
 
-def _process_instructions(instructions: list, code: types.CodeType, is_main: bool) -> list[str]:
+def _extract_body_instructions(code: types.CodeType, instructions: list) -> list[str]:
     lines = []
     stack = []
-    i = 0
 
     skip_ops = {
         "RESUME",
@@ -216,7 +327,6 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
         "LIST_EXTEND",
         "SET_UPDATE",
         "MAP_ADD",
-        "CALL_KW",
         "SETUP_FINALLY",
         "WITH_EXCEPT_START",
         "END_FINALLY",
@@ -237,6 +347,7 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
             result.insert(0, stack.pop())
         return result
 
+    i = 0
     while i < len(instructions):
         instr = instructions[i]
         op = instr.opname
@@ -247,54 +358,30 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
             continue
 
         if op == "LOAD_CONST":
-            stack.append(_format_const(code, arg))
+            stack.append(_format_const(arg, code))
 
         elif op == "LOAD_FAST":
-            stack.append(_get_name(code, arg, True))
+            stack.append(_get_local_name(arg, code))
 
         elif op == "LOAD_NAME":
-            stack.append(_get_name(code, arg, False))
+            stack.append(_get_name(arg, code))
 
         elif op == "LOAD_GLOBAL":
-            if arg is not None and (arg & 0x08):
-                idx = arg & 0x0F
-                if idx < len(code.co_names):
-                    stack.append(f"__builtins__.{code.co_names[idx]}")
-                else:
-                    stack.append("__builtins__")
-            else:
-                stack.append(_get_name(code, arg, False))
+            stack.append(_get_global_name(arg, code, instr))
 
         elif op == "STORE_FAST":
             if stack and arg is not None:
                 val = stack.pop()
-                name = _get_name(code, arg, True)
+                name = _get_local_name(arg, code)
                 if name not in internal_attrs:
                     lines.append(f"{name} = {val}")
 
         elif op == "STORE_NAME":
             if stack and arg is not None:
                 val = stack.pop()
-                name = _get_name(code, arg, False)
+                name = _get_name(arg, code)
                 if name not in internal_attrs:
                     lines.append(f"{name} = {val}")
-
-        elif op == "STORE_GLOBAL":
-            if stack and arg is not None:
-                val = stack.pop()
-                name = _get_name(code, arg, False)
-                lines.append(f"global {name}")
-                lines.append(f"{name} = {val}")
-
-        elif op == "DELETE_FAST":
-            if arg is not None:
-                name = _get_name(code, arg, True)
-                lines.append(f"del {name}")
-
-        elif op == "DELETE_NAME":
-            if arg is not None:
-                name = _get_name(code, arg, False)
-                lines.append(f"del {name}")
 
         elif op == "CALL":
             if stack:
@@ -302,17 +389,15 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
                 args = popn(arg) if arg else []
                 args_str = ", ".join(args) if args else ""
 
-                if func.startswith("'") and func.endswith("'"):
-                    name = func.strip("'")
-                    lines.append(f"# class {name}({args_str})")
-                else:
-                    lines.append(f"{func}({args_str})")
+                if not func.startswith("'"):
+                    result = f"{func}({args_str})" if args_str else f"{func}()"
+                    lines.append(result)
                 stack.clear()
 
         elif op == "RETURN_VALUE":
             if stack:
                 val = stack.pop()
-                if val != "None" or is_main:
+                if val != "None":
                     lines.append(f"return {val}")
             else:
                 lines.append("return")
@@ -329,15 +414,10 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
             else:
                 lines.append("raise")
 
-        elif op == "PRINT":
-            if stack:
-                val = stack.pop()
-                lines.append(f"print({val})")
-
         elif op == "POP_JUMP_IF_FALSE":
             if stack:
                 cond = stack.pop()
-                lines.append(f"if not {cond}:")
+                lines.append(f"if {cond}:")
                 lines.append("    pass")
 
         elif op == "POP_JUMP_IF_TRUE":
@@ -349,7 +429,7 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
         elif op == "FOR_ITER":
             if stack:
                 target = stack.pop() if stack else "_"
-                lines.append(f"for _ in {target}:")
+                lines.append(f"for {target} in ...:")
                 lines.append("    pass")
 
         elif op == "BUILD_LIST":
@@ -369,14 +449,6 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
             else:
                 stack.append("()")
 
-        elif op == "BUILD_SET":
-            count = arg if arg else 0
-            items = popn(count)
-            if items:
-                stack.append(f"{{{', '.join(items)}}}")
-            else:
-                stack.append("set()")
-
         elif op == "BUILD_DICT":
             count = arg if arg else 0
             items = popn(count * 2)
@@ -393,21 +465,7 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
             if len(stack) >= 2:
                 b = stack.pop()
                 a = stack.pop()
-                op_map = {
-                    "+": "+",
-                    "-": "-",
-                    "*": "*",
-                    "/": "//",
-                    "%": "%",
-                    "**": "**",
-                    "//": "//",
-                    "<<": "<<",
-                    ">>": ">>",
-                    "&": "&",
-                    "|": "|",
-                    "^": "^",
-                }
-                stack.append(f"({a} {op_map.get(str(instr.argrepr), '+')} {b})")
+                stack.append(f"({a} + {b})")
 
         elif op == "BINARY_ADD":
             if len(stack) >= 2:
@@ -415,96 +473,24 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
                 a = stack.pop()
                 stack.append(f"({a} + {b})")
 
-        elif op == "BINARY_MULTIPLY":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(f"({a} * {b})")
-
         elif op == "COMPARE_OP":
             if len(stack) >= 2:
                 b = stack.pop()
                 a = stack.pop()
-                cmp_map = {
-                    "<": "<",
-                    "<=": "<=",
-                    "==": "==",
-                    "!=": "!=",
-                    ">": ">",
-                    ">=": ">=",
-                    "in": "in",
-                    "not in": "not in",
-                    "is": "is",
-                    "is not": "is not",
-                }
-                stack.append(f"({a} {cmp_map.get(str(instr.argrepr), '==')} {b})")
-
-        elif op == "UNARY_NEGATIVE":
-            if stack:
-                val = stack.pop()
-                stack.append(f"(-{val})")
-
-        elif op == "UNARY_POSITIVE":
-            if stack:
-                val = stack.pop()
-                stack.append(f"(+{val})")
-
-        elif op == "UNARY_NOT":
-            if stack:
-                val = stack.pop()
-                stack.append(f"(not {val})")
-
-        elif op == "MAKE_FUNCTION":
-            if stack:
-                stack.pop()
-            if arg is not None and arg > 0:
-                pass
-
-        elif op == "IMPORT_NAME":
-            if stack:
-                stack.pop()
-            if stack:
-                stack.pop()
-            if arg is not None and arg < len(code.co_names):
-                name = code.co_names[arg]
-                lines.append(f"import {name}")
-
-        elif op == "IMPORT_FROM":
-            if stack:
-                stack.pop()
-            if arg is not None and arg < len(code.co_names):
-                name = code.co_names[arg]
-                lines.append(f"from ... import {name}")
+                stack.append(f"({a} == {b})")
 
         elif op == "LOAD_ATTR":
             if stack and arg is not None:
-                attr = _get_name(code, arg, False)
+                attr = _get_attr_name(arg, code, instr)
                 obj = stack.pop() if stack else "self"
                 stack.append(f"{obj}.{attr}")
 
         elif op == "STORE_ATTR":
             if len(stack) >= 2 and arg is not None:
                 val = stack.pop()
-                attr = _get_name(code, arg, False)
+                attr = _get_attr_name(arg, code, instr)
                 obj = stack.pop() if stack else "self"
                 lines.append(f"{obj}.{attr} = {val}")
-
-        elif op == "DELETE_ATTR":
-            if stack and arg is not None:
-                attr = _get_name(code, arg, False)
-                obj = stack.pop() if stack else "self"
-                lines.append(f"del {obj}.{attr}")
-
-        elif op == "BUILD_SLICE":
-            if arg == 2 and len(stack) >= 2:
-                stop = stack.pop()
-                start = stack.pop()
-                stack.append(f"slice({start}, {stop})")
-            elif arg == 3 and len(stack) >= 3:
-                step = stack.pop()
-                stop = stack.pop()
-                start = stack.pop()
-                stack.append(f"slice({start}, {stop}, {step})")
 
         elif op == "SUBSCR":
             if len(stack) >= 2:
@@ -512,30 +498,111 @@ def _process_instructions(instructions: list, code: types.CodeType, is_main: boo
                 obj = stack.pop() if stack else "_"
                 stack.append(f"{obj}[{idx}]")
 
-        elif op == "STORE_SUBSCR":
-            if len(stack) >= 3:
-                val = stack.pop()
-                idx = stack.pop()
-                obj = stack.pop() if stack else "_"
-                lines.append(f"{obj}[{idx}] = {val}")
-
-        elif op == "DELETE_SUBSCR":
-            if len(stack) >= 2:
-                idx = stack.pop()
-                obj = stack.pop() if stack else "_"
-                lines.append(f"del {obj}[{idx}]")
-
         elif op in ("POP_TOP", "ROT_TWO", "ROT_THREE", "ROT_FOUR"):
             if stack:
                 stack.pop()
 
-        elif op == "DUP_TOP":
-            if stack:
-                stack.append(stack[-1])
-
         i += 1
 
     return lines
+
+
+def _format_const(arg: int | None, code: types.CodeType) -> str:
+    if arg is None or arg >= len(code.co_consts):
+        return "None"
+    c = code.co_consts[arg]
+    if c is None:
+        return "None"
+    if c is Ellipsis:
+        return "..."
+    if isinstance(c, bool):
+        return "True" if c else "False"
+    if isinstance(c, str):
+        if len(c) > 50:
+            return f"'{c[:50]}...'"
+        return f"'{c}'"
+    if isinstance(c, bytes):
+        return f"b'{c[:20].decode('utf-8', errors='replace')}...'"
+    if isinstance(c, (int, float)):
+        return str(c)
+    if isinstance(c, tuple):
+        items = [str(x) for x in c]
+        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
+    if isinstance(c, (list, dict, set)):
+        return "[]" if isinstance(c, list) else "{}"
+    return repr(c)
+
+
+def _get_local_name(arg: int | None, code: types.CodeType) -> str:
+    if arg is None:
+        return "_"
+    if arg < len(code.co_varnames):
+        return code.co_varnames[arg]
+    return f"var_{arg}"
+
+
+def _get_name(arg: int | None, code: types.CodeType) -> str:
+    if arg is None:
+        return "_"
+    if arg < len(code.co_names):
+        return code.co_names[arg]
+    return f"name_{arg}"
+
+
+def _get_global_name(arg: int | None, code: types.CodeType, instr) -> str:
+    if arg is None:
+        return "_"
+    idx = arg >> 1
+    argrepr = instr.argrepr
+    if idx < len(code.co_names):
+        if "+ NULL" in argrepr:
+            return argrepr.split(" + NULL")[0]
+        return code.co_names[idx]
+    return f"_global_{idx}"
+
+
+def _get_attr_name(arg: int | None, code: types.CodeType, instr) -> str:
+    if arg is None:
+        return "attr"
+    argrepr = instr.argrepr
+    if "+ NULL|" in argrepr:
+        return argrepr.split(" + NULL|")[0]
+    if " + NULL" in argrepr:
+        return argrepr.split(" + NULL")[0]
+    if arg < len(code.co_names):
+        return code.co_names[arg]
+    return f"attr_{arg}"
+
+
+def _emit_ir(node: IRNode, indent: int = 0) -> str:
+    prefix = "    " * indent
+    lines = []
+
+    if node.ir_type == IRType.MODULE:
+        for imp in node.imports:
+            lines.append(imp)
+
+        for child in node.children:
+            lines.append(_emit_ir(child, indent))
+
+    elif node.ir_type == IRType.CLASS:
+        lines.append(f"class {node.name}:")
+        for child in node.children:
+            lines.append(_emit_ir(child, indent + 1))
+        for stmt in node.body:
+            if stmt.strip():
+                lines.append(f"    {prefix}{stmt}")
+
+    elif node.ir_type == IRType.FUNCTION:
+        args_str = ", ".join(node.args) if node.args else ""
+        lines.append(f"def {node.name}({args_str}):")
+        for child in node.children:
+            lines.append(_emit_ir(child, indent + 1))
+        for stmt in node.body:
+            if stmt.strip():
+                lines.append(f"    {prefix}{stmt}")
+
+    return "\n".join(lines)
 
 
 def main():
