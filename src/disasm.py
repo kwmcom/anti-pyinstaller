@@ -151,7 +151,7 @@ def _format_args(varnames: tuple, argcount: int, kwonly: int) -> str:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python -m anti_pynstaller.disasm <pyc_file>")
+        print("Usage: python -m src.disasm <pyc_file>")
         sys.exit(1)
 
     pyc_path = Path(sys.argv[1])

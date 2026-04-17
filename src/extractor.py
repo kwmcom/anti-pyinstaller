@@ -5,7 +5,7 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from src import logger
+from src import common, logger
 
 
 @dataclass
@@ -25,32 +25,6 @@ class ExtractionResult:
     message: str
 
 
-@dataclass
-class TOCEntry:
-    name: str
-    offset: int
-    size: int
-    compressed_size: int
-    is_compressed: bool
-    entry_type: bytes
-
-
-MAGIC_PATTERNS = [
-    b"MEI\x0c\x0b\x0a\x0b\x0e",
-    b"MEI\x0c\x0b\x0a\x0e",
-    b"MEI\x0c\x0b\x0d\x0e",
-    b"MEI\x0c\x0b\x0c\x0e",
-    b"MEI\x0c\x0b\x0b\x0e",
-]
-
-PYINST20_COOKIE_SIZE = 24
-PYINST21_COOKIE_SIZE = 88
-
-MAX_TOC_ENTRIES = 10000
-MAX_ENTRY_SIZE = 10 * 1024 * 1024
-MAX_OVERLAY_SIZE = 500 * 1024 * 1024
-
-
 def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResult:
     if not input_file.exists():
         logger.error(f"File not found: {input_file}")
@@ -65,8 +39,8 @@ def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResul
         logger.error(f"File too small: {file_size} bytes")
         return ExtractionResult(False, Path(""), None, "File too small")
 
-    if file_size > MAX_OVERLAY_SIZE * 2:
-        logger.error(f"File too large: {file_size} bytes (max {MAX_OVERLAY_SIZE * 2})")
+    if file_size > common.MAX_OVERLAY_SIZE * 2:
+        logger.error(f"File too large: {file_size} bytes (max {common.MAX_OVERLAY_SIZE * 2})")
         return ExtractionResult(False, Path(""), None, "File too large")
 
     platform = _detect_platform(input_file)
@@ -94,47 +68,11 @@ def extract(input_file: Path, output_dir: Path | None = None) -> ExtractionResul
 
 
 def _detect_platform(path: Path) -> str:
-    with open(path, "rb") as f:
-        magic = f.read(4)
-        if magic == b"\x7fELF":
-            return "linux"
-        elif magic.startswith(b"MZ"):
-            return "windows"
-    return "unknown"
+    return common._detect_platform(path)
 
 
 def _find_cookie(f, file_size: int) -> int:
-    chunk_size = 8192
-    cookie_pos = -1
-
-    for magic_pattern in MAGIC_PATTERNS:
-        end_pos = file_size
-        while True:
-            start_pos = end_pos - chunk_size if end_pos >= chunk_size else 0
-            chunk_size_adj = end_pos - start_pos
-
-            if chunk_size_adj < len(magic_pattern):
-                break
-
-            f.seek(start_pos, 0)
-            data = f.read(chunk_size_adj)
-
-            offs = data.rfind(magic_pattern)
-
-            if offs != -1:
-                cookie_pos = start_pos + offs
-                logger.debug(f"Found cookie at {cookie_pos}")
-                break
-
-            end_pos = start_pos + len(magic_pattern) - 1
-
-            if start_pos == 0:
-                break
-
-        if cookie_pos != -1:
-            break
-
-    return cookie_pos
+    return common._find_cookie_from_file(f, file_size)
 
 
 def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
@@ -148,34 +86,34 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
             return ExtractionResult(False, output_dir, None, "Cookie not found")
 
         f.seek(cookie_pos, 0)
-        cookie_data = f.read(PYINST21_COOKIE_SIZE)
+        cookie_data = f.read(common.PYINST21_COOKIE_SIZE)
 
         magic = cookie_data[:8]
         if magic[:3] != b"MEI":
             logger.error("Invalid magic bytes")
             return ExtractionResult(False, output_dir, None, "Invalid magic")
 
-        f.seek(cookie_pos + PYINST20_COOKIE_SIZE, 0)
+        f.seek(cookie_pos + common.PYINST20_COOKIE_SIZE, 0)
         cookie_check = f.read(64)
 
         if b"python" in cookie_check.lower():
             (magic_bytes, lengthofPackage, toc_offset, tocLen, pyver, pylibname) = struct.unpack(
                 "!8sIIii64s", cookie_data
             )
-            cookie_size = PYINST21_COOKIE_SIZE
+            cookie_size = common.PYINST21_COOKIE_SIZE
             pyinst_ver = "2.1+"
         else:
             (magic_bytes, lengthofPackage, toc_offset, tocLen, pyver) = struct.unpack(
                 "!8siiii", cookie_data[:24]
             )
-            cookie_size = PYINST20_COOKIE_SIZE
+            cookie_size = common.PYINST20_COOKIE_SIZE
             pyinst_ver = "2.0"
 
         if pyver == 0 or pyver > 1000:
             logger.error(f"Invalid Python version: {pyver}")
             return ExtractionResult(False, output_dir, None, "Invalid Python version")
 
-        if lengthofPackage < 0 or lengthofPackage > MAX_OVERLAY_SIZE:
+        if lengthofPackage < 0 or lengthofPackage > common.MAX_OVERLAY_SIZE:
             logger.error(f"Invalid overlay size: {lengthofPackage}")
             return ExtractionResult(False, output_dir, None, "Invalid overlay size")
 
@@ -243,7 +181,7 @@ def _extract_archive(input_path: Path, output_dir: Path) -> ExtractionResult:
 
 def _parse_toc_entries(
     toc_data: bytes, overlay_pos: int, file_size: int
-) -> tuple[list[TOCEntry], str | None, int]:
+) -> tuple[list[common.TOCEntry], str | None, int]:
     entries = []
     entry_point = None
     skipped = 0
@@ -254,8 +192,8 @@ def _parse_toc_entries(
 
     while pos < len(toc_data):
         iterations += 1
-        if iterations > MAX_TOC_ENTRIES:
-            logger.warning(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+        if iterations > common.MAX_TOC_ENTRIES:
+            logger.warning(f"TOC: max iterations reached ({common.MAX_TOC_ENTRIES})")
             break
 
         if pos + 4 > len(toc_data):
@@ -264,7 +202,7 @@ def _parse_toc_entries(
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
 
-        if entry_size <= 0 or entry_size > MAX_ENTRY_SIZE:
+        if entry_size <= 0 or entry_size > common.MAX_ENTRY_SIZE:
             logger.debug(f"TOC: invalid entry size {entry_size}, skipping")
             skipped += 1
             pos += 4
@@ -315,7 +253,7 @@ def _parse_toc_entries(
                 pos += entry_size
                 continue
 
-            entry = TOCEntry(
+            entry = common.TOCEntry(
                 name=name,
                 offset=abs_pos,
                 size=uncmprsd_size,
@@ -332,7 +270,6 @@ def _parse_toc_entries(
         except Exception as e:
             logger.debug(f"TOC parse error: {e}")
             skipped += 1
-            pass
 
         pos += entry_size
 
@@ -345,7 +282,7 @@ def _sanitize_path(name: str) -> str:
     return name
 
 
-def _has_pyc_header(entry: TOCEntry, f) -> bool:
+def _has_pyc_header(entry: common.TOCEntry, f) -> bool:
     f.seek(entry.offset, 0)
     data = f.read(min(entry.compressed_size, 16))
     if len(data) >= 4:
@@ -354,7 +291,7 @@ def _has_pyc_header(entry: TOCEntry, f) -> bool:
     return False
 
 
-def _read_entry_data(f, entry: TOCEntry):
+def _read_entry_data(f, entry: common.TOCEntry):
     f.seek(entry.offset, 0)
     data = f.read(entry.compressed_size)
 
@@ -368,7 +305,7 @@ def _read_entry_data(f, entry: TOCEntry):
     return data
 
 
-def _write_entry(f, entry: TOCEntry, output_dir: Path, pyc_magic: bytes | None = None) -> bool:
+def _write_entry(f, entry: common.TOCEntry, output_dir: Path, pyc_magic: bytes | None = None) -> bool:
     data = _read_entry_data(f, entry)
     if data is None:
         return False

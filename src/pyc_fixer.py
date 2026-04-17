@@ -23,6 +23,9 @@ PYC_MAGIC_NUMBERS = {
     (3, 14): b"\x49\x0d\x0d\x0a",
 }
 
+# Inverse mapping: magic bytes -> version tuple
+PYC_MAGIC_NUMBERS_INV = {v: k for k, v in PYC_MAGIC_NUMBERS.items()}
+
 
 def get_pyc_header_size(python_version: tuple[int, int]) -> int:
     if python_version >= (3, 7):
@@ -109,4 +112,10 @@ def fix_directory(directory: Path, python_version: tuple[int, int] | None = None
 
 
 def _detect_python_version(pyc_path: Path) -> tuple[int, int] | None:
-    return (3, 10)
+    """Detect Python version from PYC magic bytes in file."""
+    try:
+        with open(pyc_path, "rb") as f:
+            magic = f.read(4)
+            return PYC_MAGIC_NUMBERS_INV.get(magic)
+    except Exception:
+        return None

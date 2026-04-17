@@ -23,6 +23,7 @@ class IRNode:
     body: list[str] = field(default_factory=list)
     children: list["IRNode"] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    decorators: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -104,42 +105,38 @@ def _build_ir(code: types.CodeType) -> IRNode:
 
     module_defs = _extract_module_definitions(code, instructions)
 
-    for def_type, def_name, def_code in module_defs:
+    for def_type, def_name, def_code, decorators in module_defs:
         if def_type == "class":
-            class_node = _build_class_ir(def_code, def_name)
+            class_node = _build_class_ir(def_code, def_name, decorators)
             module.children.append(class_node)
         else:
-            func_node = _build_function_ir(def_code)
+            func_node = _build_function_ir(def_code, decorators)
             module.children.append(func_node)
 
     return module
 
 
 def _extract_module_definitions(code: types.CodeType, instructions: list):
+    """Extract top-level class and function definitions from module bytecode."""
     definitions = []
-    pending_class = None
-    pending_func = None
-
     skip_names = {
-        "__init__",
-        "__annotate__",
-        "__static_attributes__",
-        "__annotate_func__",
-        "__classdictcell__",
+        "__init__", "__annotate__", "__static_attributes__",
+        "__annotate_func__", "__classdictcell__", "__module__",
+        "__qualname__", "__doc__", "__class__",
     }
+
+    # Pre-index code objects by name
+    code_objects_by_name = {}
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            code_objects_by_name[const.co_name] = const
 
     i = 0
     while i < len(instructions):
         instr = instructions[i]
         op = instr.opname
 
-        if op == "LOAD_BUILD_CLASS":
-            pending_class = True
-
-        elif op == "MAKE_FUNCTION":
-            pending_func = True
-
-        elif op == "STORE_NAME":
+        if op in ("STORE_NAME", "STORE_GLOBAL"):
             arg = instr.arg
             if arg is not None and arg < len(code.co_names):
                 name = code.co_names[arg]
@@ -147,22 +144,43 @@ def _extract_module_definitions(code: types.CodeType, instructions: list):
                     i += 1
                     continue
 
-                if pending_class:
-                    for const in code.co_consts:
-                        if isinstance(const, types.CodeType):
-                            class_name = _get_class_name(const, code)
-                            if class_name == name and _is_class_definition(const):
-                                definitions.append(("class", name, const))
-                                pending_class = None
-                                break
+                # Look backwards to determine if this is a class or function
+                found_class = False
+                found_func = False
+                class_code = None
+                func_code = None
+                decorators = []
 
-                elif pending_func:
-                    for const in code.co_consts:
-                        if isinstance(const, types.CodeType):
-                            if const.co_name == name and not _is_class_definition(const):
-                                definitions.append(("function", name, const))
-                                pending_func = None
-                                break
+                for j in range(max(0, i - 25), i):
+                    prev_op = instructions[j].opname
+
+                    if prev_op == "LOAD_BUILD_CLASS":
+                        # This is a class definition
+                        # The class code object should be in consts
+                        if name in code_objects_by_name:
+                            class_code = code_objects_by_name[name]
+                            if _is_class_definition(class_code):
+                                found_class = True
+
+                    elif prev_op == "MAKE_FUNCTION":
+                        # This is a function definition
+                        if name in code_objects_by_name:
+                            func_code = code_objects_by_name[name]
+                            if not _is_class_definition(func_code) and func_code.co_name == name:
+                                found_func = True
+
+                    elif prev_op == "LOAD_NAME":
+                        # Could be a decorator
+                        dec_arg = instructions[j].arg
+                        if dec_arg is not None and dec_arg < len(code.co_names):
+                            dec_name = code.co_names[dec_arg]
+                            if dec_name not in skip_names:
+                                decorators.append(dec_name)
+
+                if found_class and class_code:
+                    definitions.append(("class", name, class_code, decorators))
+                elif found_func and func_code:
+                    definitions.append(("function", name, func_code, decorators))
 
         i += 1
 
@@ -253,7 +271,7 @@ def _get_class_name(class_code: types.CodeType, parent_code: types.CodeType) -> 
     return class_code.co_name
 
 
-def _build_function_ir(code: types.CodeType) -> IRNode:
+def _build_function_ir(code: types.CodeType, decorators: list = None) -> IRNode:
     args = list(code.co_varnames[: code.co_argcount])
     kwonly = code.co_kwonlyargcount
     if kwonly:
@@ -265,6 +283,7 @@ def _build_function_ir(code: types.CodeType) -> IRNode:
         ir_type=IRType.FUNCTION,
         code=code,
         args=args,
+        decorators=decorators or [],
     )
 
     func_defs, class_defs = _extract_nested_definitions(code)
@@ -279,11 +298,12 @@ def _build_function_ir(code: types.CodeType) -> IRNode:
     return func_node
 
 
-def _build_class_ir(code: types.CodeType, name: str) -> IRNode:
+def _build_class_ir(code: types.CodeType, name: str, decorators: list = None) -> IRNode:
     class_node = IRNode(
         name=name,
         ir_type=IRType.CLASS,
         code=code,
+        decorators=decorators or [],
     )
 
     for const in code.co_consts:
@@ -586,6 +606,8 @@ def _emit_ir(node: IRNode, indent: int = 0) -> str:
             lines.append(_emit_ir(child, indent))
 
     elif node.ir_type == IRType.CLASS:
+        for dec in node.decorators:
+            lines.append(f"@{dec}")
         lines.append(f"class {node.name}:")
         for child in node.children:
             lines.append(_emit_ir(child, indent + 1))
@@ -594,6 +616,8 @@ def _emit_ir(node: IRNode, indent: int = 0) -> str:
                 lines.append(f"    {prefix}{stmt}")
 
     elif node.ir_type == IRType.FUNCTION:
+        for dec in node.decorators:
+            lines.append(f"@{dec}")
         args_str = ", ".join(node.args) if node.args else ""
         lines.append(f"def {node.name}({args_str}):")
         for child in node.children:

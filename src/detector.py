@@ -2,7 +2,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from src import logger
+from src import common, logger
 
 
 @dataclass
@@ -24,47 +24,6 @@ class TOCEntry:
     compressed_size: int
     is_compressed: bool
     entry_type: bytes
-
-
-MAGIC_PATTERNS = [
-    b"MEI\x0c\x0b\x0a\x0b\x0e",
-    b"MEI\x0c\x0b\x0a\x0e",
-    b"MEI\x0c\x0b\x0d\x0e",
-    b"MEI\x0c\x0b\x0c\x0e",
-    b"MEI\x0c\x0b\x0b\x0e",
-]
-
-PYINST20_COOKIE_SIZE = 24
-PYINST21_COOKIE_SIZE = 88
-
-MAX_TOC_ENTRIES = 10000
-MAX_ENTRY_SIZE = 10 * 1024 * 1024
-MAX_OVERLAY_SIZE = 500 * 1024 * 1024
-
-PYC_MAGIC_TO_VERSION = {
-    b"\x33\x0d\x0d\x0a": (3, 1),
-    b"\x34\x0d\x0d\x0a": (3, 2),
-    b"\xbb\x0d\x0d\x0a": (3, 3),
-    b"\xbc\x0d\x0d\x0a": (3, 4),
-    b"\xbd\x0d\x0d\x0a": (3, 5),
-    b"\xbe\x0d\x0d\x0a": (3, 6),
-    b"\xbf\x0d\x0d\x0a": (3, 7),
-    b"\xc0\x0d\x0d\x0a": (3, 8),
-    b"\xc1\x0d\x0d\x0a": (3, 9),
-    b"\xc2\x0d\x0d\x0a": (3, 10),
-    b"\xc3\x0d\x0d\x0a": (3, 11),
-    b"\xc4\x0d\x0d\x0a": (3, 12),
-    b"\xc5\x0d\x0d\x0a": (3, 13),
-    b"\xc6\x0d\x0d\x0a": (3, 14),
-    b"\x42\x0d\x0d\x0a": (2, 7),
-    b"\xeb\x0d\x0d\x0a": (3, 0),
-    b"\xec\x0d\x0d\x0a": (3, 1),
-    b"\xed\x0d\x0d\x0a": (3, 2),
-    b"\xee\x0d\x0d\x0a": (3, 3),
-    b"\xef\x0d\x0d\x0a": (3, 4),
-    b"\xf0\x0d\x0d\x0a": (3, 5),
-    b"\xf1\x0d\x0d\x0a": (3, 6),
-}
 
 
 def detect(path: Path) -> PyInstallerInfo | None:
@@ -96,14 +55,14 @@ def detect(path: Path) -> PyInstallerInfo | None:
     try:
         with open(path, "rb") as f:
             f.seek(cookie_pos, 0)
-            cookie_data = f.read(PYINST21_COOKIE_SIZE)
+            cookie_data = f.read(common.PYINST21_COOKIE_SIZE)
 
             magic = cookie_data[:8]
             if magic[:3] != b"MEI":
                 logger.error("Invalid magic bytes")
                 return None
 
-            f.seek(cookie_pos + PYINST20_COOKIE_SIZE, 0)
+            f.seek(cookie_pos + common.PYINST20_COOKIE_SIZE, 0)
             cookie_check = f.read(64)
 
             if b"python" in cookie_check.lower():
@@ -121,7 +80,7 @@ def detect(path: Path) -> PyInstallerInfo | None:
                 logger.error(f"Invalid Python version: {pyver}")
                 return None
 
-            if lengthofPackage < 0 or lengthofPackage > MAX_OVERLAY_SIZE:
+            if lengthofPackage < 0 or lengthofPackage > common.MAX_OVERLAY_SIZE:
                 logger.error(f"Invalid overlay size: {lengthofPackage}")
                 return None
 
@@ -138,7 +97,7 @@ def detect(path: Path) -> PyInstallerInfo | None:
             tail_bytes = (
                 file_size
                 - cookie_pos
-                - (PYINST21_COOKIE_SIZE if pyinst_ver == "2.1+" else PYINST20_COOKIE_SIZE)
+                - (common.PYINST21_COOKIE_SIZE if pyinst_ver == "2.1+" else common.PYINST20_COOKIE_SIZE)
             )
             overlay_size = lengthofPackage + tail_bytes
             overlay_pos = file_size - overlay_size
@@ -159,15 +118,15 @@ def detect(path: Path) -> PyInstallerInfo | None:
 
             logger.info(f"TOC: {len(entries)} entries, {skipped} skipped")
 
-        return PyInstallerInfo(
-            is_pyinstaller=True,
-            version=pyinst_ver,
-            python_version=(pymaj, pymin),
-            platform=platform,
-            is_encrypted=encrypted,
-            entry_point=entry_point,
-            file_count=len(entries),
-        )
+            return PyInstallerInfo(
+                is_pyinstaller=True,
+                version=pyinst_ver,
+                python_version=(pymaj, pymin),
+                platform=platform,
+                is_encrypted=encrypted,
+                entry_point=entry_point,
+                file_count=len(entries),
+            )
     except Exception as e:
         logger.error(f"Failed to parse: {e}")
         logger.debug(f"Exception details: {type(e).__name__}: {e}")
@@ -175,56 +134,16 @@ def detect(path: Path) -> PyInstallerInfo | None:
 
 
 def _detect_platform(path: Path) -> str:
-    with open(path, "rb") as f:
-        magic = f.read(4)
-        if magic == b"\x7fELF":
-            return "linux"
-        elif magic.startswith(b"MZ"):
-            return "windows"
-    return "unknown"
+    return common._detect_platform(path)
 
 
 def _find_cookie(path: Path) -> int:
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        file_size = f.tell()
-
-        chunk_size = 8192
-        cookie_pos = -1
-
-        for magic_pattern in MAGIC_PATTERNS:
-            end_pos = file_size
-            while True:
-                start_pos = end_pos - chunk_size if end_pos >= chunk_size else 0
-                chunk_size_adj = end_pos - start_pos
-
-                if chunk_size_adj < len(magic_pattern):
-                    break
-
-                f.seek(start_pos, 0)
-                data = f.read(chunk_size_adj)
-
-                offs = data.rfind(magic_pattern)
-
-                if offs != -1:
-                    cookie_pos = start_pos + offs
-                    logger.debug(f"Found magic pattern at {cookie_pos}")
-                    break
-
-                end_pos = start_pos + len(magic_pattern) - 1
-
-                if start_pos == 0:
-                    break
-
-            if cookie_pos != -1:
-                break
-
-    return cookie_pos
+    return common._find_cookie(path)
 
 
 def _parse_toc_info(
     toc_data: bytes, overlay_pos: int, file_size: int
-) -> tuple[list[TOCEntry], str | None, bool, int]:
+) -> tuple[list[common.TOCEntry], str | None, bool, int]:
     entries = []
     entry_point = None
     encrypted = False
@@ -236,8 +155,8 @@ def _parse_toc_info(
 
     while pos < len(toc_data):
         iterations += 1
-        if iterations > MAX_TOC_ENTRIES:
-            logger.warning(f"TOC: max iterations reached ({MAX_TOC_ENTRIES})")
+        if iterations > common.MAX_TOC_ENTRIES:
+            logger.warning(f"TOC: max iterations reached ({common.MAX_TOC_ENTRIES})")
             break
 
         if pos + 4 > len(toc_data):
@@ -246,7 +165,7 @@ def _parse_toc_info(
 
         entry_size = struct.unpack("!i", toc_data[pos : pos + 4])[0]
 
-        if entry_size <= 0 or entry_size > MAX_ENTRY_SIZE:
+        if entry_size <= 0 or entry_size > common.MAX_ENTRY_SIZE:
             logger.debug(f"TOC: invalid entry size {entry_size}")
             skipped += 1
             pos += 4
@@ -297,7 +216,7 @@ def _parse_toc_info(
                 pos += entry_size
                 continue
 
-            entry = TOCEntry(
+            entry = common.TOCEntry(
                 name=name,
                 offset=abs_pos,
                 size=uncmprsd_size,
@@ -318,7 +237,6 @@ def _parse_toc_info(
         except Exception as e:
             logger.debug(f"TOC parse error: {e}")
             skipped += 1
-            pass
 
         pos += entry_size
 
@@ -326,4 +244,4 @@ def _parse_toc_info(
 
 
 def python_magic_to_version(magic: bytes) -> tuple[int, int] | None:
-    return PYC_MAGIC_TO_VERSION.get(magic[:4])
+    return common.PYC_MAGIC_TO_VERSION.get(magic[:4])
