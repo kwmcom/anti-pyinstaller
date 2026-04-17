@@ -536,7 +536,20 @@ class BytecodeEmitter:
         }
 
     def get_statements(self) -> list[str]:
-        return self.statements
+        # Post-process to fix broken constructs from skipped exception opcodes
+        fixed = []
+        for stmt in self.statements:
+            # Fix broken "if Exception:" statements from exception handling
+            if stmt.strip().startswith("if "):
+                # Check if condition looks like a type name (exception class)
+                cond = stmt.split(":", 1)[0].replace("if ", "").strip()
+                if cond and cond[0].isupper():
+                    # This is likely "if FileNotFoundError:" or "if Exception:"
+                    fixed.append(f"# TODO: exception handling for {cond}")
+                    fixed.append("    pass")
+                    continue
+            fixed.append(stmt)
+        return fixed
 
     def process(self, instr):
         op = instr.opname
