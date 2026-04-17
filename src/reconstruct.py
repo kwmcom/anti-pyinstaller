@@ -114,23 +114,177 @@ def _detect_header_size(f) -> int:
     return 16 if file_size > 16 else 8
 
 
-def _build_ir(code: types.CodeType) -> IRNode:
-    instructions = list(dis.get_instructions(code))
+def _build_ir(code: types.CodeType, name: str = "<module>") -> IRNode:
+    """Build IR tree from code object using scope-aware traversal.
 
-    module = IRNode(name="<module>", ir_type=IRType.MODULE, code=code)
+    Uses code object hierarchy (co_consts) not opcode guessing.
+    """
+    module = IRNode(name=name, ir_type=IRType.MODULE, code=code)
     module.imports = _extract_imports(code)
 
-    module_defs = _extract_module_definitions(code, instructions)
+    # Build scope tree from code object hierarchy
+    scope_tree = _build_scope_tree(code)
 
-    for def_type, def_name, def_code, decorators in module_defs:
-        if def_type == "class":
-            class_node = _build_class_ir(def_code, def_name, decorators)
-            module.children.append(class_node)
-        else:
-            func_node = _build_function_ir(def_code, decorators)
-            module.children.append(func_node)
+    # Convert scope tree to IR nodes
+    for item in scope_tree:
+        node = _scope_to_ir(item)
+        if node:
+            module.children.append(node)
 
     return module
+
+
+def _is_class_code(code: types.CodeType) -> bool:
+    """Check if a code object represents a class definition."""
+    # Class code objects have internal markers
+    instructions = list(dis.get_instructions(code))
+
+    # Must have MAKE_CELL early (class cell)
+    has_cell = False
+    for instr in instructions:
+        if instr.opname == "MAKE_CELL":
+            has_cell = True
+            break
+        # Stop scanning after a few instructions
+        if instr.offset > 20:
+            break
+
+    # Class code co_name is the class name, code runs in class body context
+    return has_cell and code.co_name not in ("<module>", "<lambda>")
+
+
+def _build_scope_tree(code: types.CodeType) -> list[dict]:
+    """Build scope tree by walking code object hierarchy.
+
+    Returns list of scope items, each with type, name, code, and children.
+    """
+    scopes = []
+
+    # Process code objects in order they appear in co_consts
+    # Track which code objects are already assigned as children
+    assigned = set()
+
+    for const in code.co_consts:
+        if not isinstance(const, types.CodeType):
+            continue
+        if const in assigned:
+            continue
+        if const.co_name in ("<module>", "<lambda>", "<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>"):
+            continue
+        if const.co_name.startswith("__annotate__"):
+            continue
+
+        scope_info = _analyze_scope_item(const, assigned)
+        if scope_info:
+            scopes.append(scope_info)
+
+    return scopes
+
+
+def _analyze_scope_item(code: types.CodeType, assigned: set) -> dict | None:
+    """Analyze a single code object and build its scope info."""
+
+    if code.co_name.startswith("__") and code.co_name not in ("__init__",):
+        return None
+
+    is_class = _is_class_code(code)
+
+    scope = {
+        "type": "class" if is_class else "function",
+        "name": code.co_name,
+        "code": code,
+        "children": [],
+    }
+
+    # Find nested definitions in this scope's code objects
+    for const in code.co_consts:
+        if not isinstance(const, types.CodeType):
+            continue
+        if const in assigned:
+            continue
+
+        # Skip special/dunder methods
+        if const.co_name.startswith("__") and const.co_name not in ("__init__",):
+            assigned.add(const)
+            continue
+
+        nested = _analyze_scope_item(const, assigned)
+        if nested:
+            scope["children"].append(nested)
+            assigned.add(const)
+
+    return scope
+
+
+def _scope_to_ir(scope: dict) -> IRNode | None:
+    """Convert scope dict to IRNode."""
+    scope_type = scope.get("type")
+    name = scope.get("name")
+    code = scope.get("code")
+    children = scope.get("children", [])
+
+    if not code:
+        return None
+
+    if scope_type == "class":
+        node = _build_class_from_scope(scope)
+    else:
+        node = _build_function_from_scope(scope)
+
+    return node
+
+
+def _build_class_from_scope(scope: dict) -> IRNode:
+    """Build class IR node from scope info."""
+    code = scope["code"]
+    name = scope["name"]
+    children_scopes = scope.get("children", [])
+
+    class_node = IRNode(
+        name=name,
+        ir_type=IRType.CLASS,
+        code=code,
+    )
+
+    # Convert children scopes to IR
+    for child_scope in children_scopes:
+        child_node = _scope_to_ir(child_scope)
+        if child_node:
+            class_node.children.append(child_node)
+
+    return class_node
+
+
+def _build_function_from_scope(scope: dict) -> IRNode:
+    """Build function IR node from scope info."""
+    code = scope["code"]
+    name = scope["name"]
+    children_scopes = scope.get("children", [])
+
+    # Build args list from varnames
+    args = list(code.co_varnames[:code.co_argcount])
+    kwonly = code.co_kwonlyargcount
+    if kwonly > 0:
+        args.append("*")
+        args.extend(code.co_varnames[code.co_argcount:code.co_argcount + kwonly])
+
+    func_node = IRNode(
+        name=name,
+        ir_type=IRType.FUNCTION,
+        code=code,
+        args=args,
+    )
+
+    # Convert children scopes (nested functions/classes)
+    for child_scope in children_scopes:
+        child_node = _scope_to_ir(child_scope)
+        if child_node:
+            func_node.children.append(child_node)
+
+    # Build function body
+    func_node.body = _extract_function_body(code)
+
+    return func_node
 
 
 def _extract_module_definitions(code: types.CodeType, instructions: list):
