@@ -645,10 +645,11 @@ class BytecodeEmitter:
                 self.stack.append(f"{obj}[{idx}]")
 
         elif op == "STORE_SUBSCR":
+            # stack: [container, index, value] -> container[index] = value
             if len(self.stack) >= 3:
-                val = self.stack.pop()
-                idx = self.stack.pop()
-                obj = self.stack.pop() if self.stack else "_"
+                val = self.stack.pop()  # TOS = value
+                idx = self.stack.pop()  # TOS1 = index
+                obj = self.stack.pop()  # TOS2 = container
                 self.statements.append(f"{obj}[{idx}] = {val}")
 
         # Return
