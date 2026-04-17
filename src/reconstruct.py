@@ -936,8 +936,25 @@ class BlockEvaluator:
             self.stack.append(self._format_const(arg))
             return None
 
-        if op in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+        # Handle Python 3.11+ super instructions and variants
+        if op in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK",
+                  "LOAD_FAST_AND_CLEAR", "LOAD_FAST_LOAD_FAST", "COPY_FREE_VARS"):
             self.stack.append(self._get_varname(arg))
+            return None
+
+        # Super instruction: loads two variables at once
+        if op == "LOAD_FAST_BORROW_LOAD_FAST_BORROW":
+            # arg is encoded pair: low bits = first, high bits = second var
+            # Format varies by Python version, decode conservatively
+            if arg is not None:
+                # Try to decode paired vars - encoding is version-dependent
+                var1_idx = arg & 0xFF
+                var2_idx = (arg >> 8) & 0xFF if arg > 255 else (arg >> 1)
+                self.stack.append(self._get_varname(var1_idx))
+                self.stack.append(self._get_varname(var2_idx))
+                return None
+            self.stack.append(self.UNKNOWN_EXPR)
+            self.stack.append(self.UNKNOWN_EXPR)
             return None
 
         if op in ("LOAD_NAME", "LOAD_GLOBAL"):
@@ -951,10 +968,27 @@ class BlockEvaluator:
             return None
 
         # Store operations (pop from stack, emit statement)
-        if op in ("STORE_FAST", "STORE_NAME", "STORE_GLOBAL"):
+        # Super instruction: store to two variables
+        if op == "STORE_FAST_STORE_FAST":
+            if len(self.stack) >= 2:
+                val2 = self.stack.pop()
+                val1 = self.stack.pop()
+                # arg encodes two var indices
+                if arg is not None:
+                    var1_idx = arg & 0xFF
+                    var2_idx = (arg >> 8) & 0xFF if arg > 255 else None
+                    name1 = self._get_varname(var1_idx)
+                    name2 = self._get_varname(var2_idx) if var2_idx is not None else f"var_{arg}"
+                    # Emit as tuple unpacking or separate stores
+                    return f"{name1}, {name2} = {val1}, {val2}"
+            self.unknown_count += 1
+            return None
+
+        if op in ("STORE_FAST", "STORE_NAME", "STORE_GLOBAL",
+                  "STORE_FAST_LOAD_FAST", "STORE_FAST_STORE_FAST"):
             if self.stack:
                 val = self.stack.pop()
-                name = self._get_varname(arg) if op == "STORE_FAST" else self._get_name(arg)
+                name = self._get_varname(arg) if op in ("STORE_FAST", "STORE_FAST_LOAD_FAST", "STORE_FAST_STORE_FAST") else self._get_name(arg)
                 if name and not name.startswith("__"):
                     return f"{name} = {val}"
             return None
