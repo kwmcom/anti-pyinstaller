@@ -754,33 +754,53 @@ class BytecodeEmitter:
             self.stack.append(f"call({', '.join(args)})")
 
     def _emit_kw_call(self, argc: int | None):
-        """Emit a function call with keyword arguments."""
-        # CALL_KW: pop kwargs dict, then argc args
-        if self.stack:
-            kwargs = self.stack.pop()  # This should be the kwargs dict
-        else:
-            kwargs = ""
+        """Emit a function call with keyword arguments.
 
+        CALL_KW stack layout (bottom to top):
+            [func, pos_arg1, ..., pos_argN, kw_val1, ..., kw_valM, tuple_of_kw_names]
+            argc = N + M (total args including keyword values)
+        """
         if argc is None:
             argc = 0
-        argc = max(0, argc - 1)  # Adjust for kwargs dict
 
+        # Pop keyword names tuple (top of stack)
+        kw_names = self.stack.pop() if self.stack else "()"
+
+        # Parse keyword names tuple like "('role',)" -> ['role']
+        kw_names_list = []
+        if kw_names and kw_names.startswith("(") and kw_names.endswith(")"):
+            inner = kw_names[1:-1]
+            if inner.endswith(","):
+                inner = inner[:-1]
+            if inner:
+                kw_names_list = [x.strip().strip("'") for x in inner.split(",")]
+
+        num_kwargs = len(kw_names_list)
+        num_posargs = argc - num_kwargs
+
+        # Pop keyword values
+        kwargs = {}
+        for i in range(min(num_kwargs, len(self.stack))):
+            val = self.stack.pop()
+            name = kw_names_list[num_kwargs - 1 - i] if i < len(kw_names_list) else f"kw_{i}"
+            kwargs[name] = val
+
+        # Pop positional args
         args = []
-        for _ in range(min(argc, len(self.stack))):
+        for _ in range(min(num_posargs, len(self.stack))):
             args.insert(0, self.stack.pop())
 
-        if self.stack:
-            func = self.stack.pop()
-            if " + NULL" in func:
-                func = func.split(" + NULL")[0]
+        # Pop function
+        func = self.stack.pop() if self.stack else "_"
+        if " + NULL" in func:
+            func = func.split(" + NULL")[0]
 
-            args_str = ", ".join(args)
-            if kwargs and kwargs != "None":
-                # Try to reconstruct kwargs
-                args_str += f", {kwargs}"
-            self.stack.append(f"{func}({args_str})")
-        else:
-            self.stack.append(f"kwcall({', '.join(args)})")
+        # Build call string
+        arg_strs = args
+        kw_strs = [f"{k}={v}" for k, v in kwargs.items()]
+        all_args = arg_strs + kw_strs
+        call_str = f"{func}({', '.join(all_args)})"
+        self.stack.append(call_str)
 
     def _emit_method_call(self, argc: int | None):
         """Emit a method call."""
