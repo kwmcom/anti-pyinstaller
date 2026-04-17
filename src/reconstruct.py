@@ -1,3 +1,21 @@
+"""
+Bytecode reconstructor for Python 3.11+ - converts .pyc to pseudo-Python source.
+
+This is a work in progress. The reconstruction handles:
+- Imports (import, from...import)
+- Class and function definitions with decorators
+- Basic expressions (literals, variables, attribute access)
+- Simple function calls
+- Basic control flow (if, for, while - simplified)
+- Return statements
+
+Limitations:
+- Complex control flow (nested conditionals, try/except/with) is incomplete
+- Keyword arguments may not reconstruct properly
+- Binary operations have limited operator support
+- Some Python 3.11+ specific opcodes not fully handled
+"""
+
 import dis
 import marshal
 import sys
@@ -39,7 +57,6 @@ def reconstruct(pyc_path: Path, output_path: Path | None = None) -> ReconstructR
 
     try:
         with open(pyc_path, "rb") as f:
-            magic = f.read(4)
             header_size = _detect_header_size(f)
             f.seek(0)
             f.read(header_size)
@@ -53,16 +70,16 @@ def reconstruct(pyc_path: Path, output_path: Path | None = None) -> ReconstructR
             if not isinstance(code_obj, types.CodeType):
                 return ReconstructResult(False, None, "Not a valid code object")
 
-        ir = _build_ir(code_obj)
-        output = _emit_ir(ir)
+            ir = _build_ir(code_obj)
+            output = _emit_ir(ir)
 
-        if output_path is None:
-            output_path = pyc_path.with_suffix(".py")
+            if output_path is None:
+                output_path = pyc_path.with_suffix(".py")
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(output)
 
-        return ReconstructResult(True, output_path, "Reconstruction complete")
+            return ReconstructResult(True, output_path, "Reconstruction complete")
     except Exception as e:
         return ReconstructResult(False, None, str(e))
 
@@ -156,7 +173,6 @@ def _extract_module_definitions(code: types.CodeType, instructions: list):
 
                     if prev_op == "LOAD_BUILD_CLASS":
                         # This is a class definition
-                        # The class code object should be in consts
                         if name in code_objects_by_name:
                             class_code = code_objects_by_name[name]
                             if _is_class_definition(class_code):
@@ -198,21 +214,18 @@ def _extract_imports(code: types.CodeType) -> list[str]:
             if instr.arg is not None and instr.arg < len(code.co_names):
                 current_module = code.co_names[instr.arg]
 
-                next_instr = None
-                try:
-                    idx = list(dis.get_instructions(code)).index(instr)
-                    all_instrs = list(dis.get_instructions(code))
-                    if idx + 1 < len(all_instrs):
-                        next_instr = all_instrs[idx + 1].opname
-                except:
-                    pass
+            # Check next instruction
+            next_is_import_from = False
+            idx = list(dis.get_instructions(code)).index(instr)
+            all_instrs = list(dis.get_instructions(code))
+            if idx + 1 < len(all_instrs):
+                next_is_import_from = all_instrs[idx + 1].opname == "IMPORT_FROM"
 
-                if next_instr != "IMPORT_FROM":
-                    if current_module not in seen and not current_module.startswith("_"):
-                        imports.append(f"import {current_module}")
-                        seen.add(current_module)
-
-                from_names = []
+            if not next_is_import_from and current_module:
+                if current_module not in seen and not current_module.startswith("_"):
+                    imports.append(f"import {current_module}")
+                    seen.add(current_module)
+            from_names = []
 
         elif instr.opname == "IMPORT_FROM":
             if instr.arg is not None and instr.arg < len(code.co_names):
@@ -225,58 +238,32 @@ def _extract_imports(code: types.CodeType) -> list[str]:
                     import_str = f"from {current_module} import {', '.join(from_names)}"
                     imports.append(import_str)
                     seen.add(current_module)
-
-            current_module = None
-            from_names = []
+                current_module = None
+                from_names = []
 
     return imports
 
 
-def _extract_nested_definitions(code: types.CodeType):
-    functions = []
-    classes = []
-
-    for const in code.co_consts:
-        if isinstance(const, types.CodeType):
-            if const.co_name not in ("<module>", "<lambda>", "__init__"):
-                if const.co_name not in (
-                    "__annotate__",
-                    "__static_attributes__",
-                    "__annotate_func__",
-                ):
-                    if _is_class_definition(const):
-                        class_name = _get_class_name(const, code)
-                        if class_name:
-                            classes.append((const, class_name))
-                    else:
-                        functions.append(const)
-
-    return functions, classes
-
-
 def _is_class_definition(nested_code: types.CodeType) -> bool:
+    """Check if a code object represents a class definition."""
     instructions = list(dis.get_instructions(nested_code))
-    if instructions and instructions[0].opname == "MAKE_CELL":
-        return True
+    for instr in instructions:
+        if instr.opname in ("MAKE_CELL", "LOAD_BUILD_CLASS"):
+            return True
     return False
 
 
-def _get_class_name(class_code: types.CodeType, parent_code: types.CodeType) -> str | None:
-    for i, const in enumerate(parent_code.co_consts):
-        if const is class_code:
-            if i + 1 < len(parent_code.co_consts):
-                next_const = parent_code.co_consts[i + 1]
-                if isinstance(next_const, str):
-                    return next_const
-    return class_code.co_name
-
-
 def _build_function_ir(code: types.CodeType, decorators: list = None) -> IRNode:
-    args = list(code.co_varnames[: code.co_argcount])
+    """Build IR for a function including nested definitions."""
+    args = []
+    argcount = code.co_argcount
     kwonly = code.co_kwonlyargcount
-    if kwonly:
-        args.append("*")
-        args.extend(code.co_varnames[code.co_argcount : code.co_argcount + kwonly])
+
+    if code.co_varnames:
+        args = list(code.co_varnames[:argcount])
+        if kwonly > 0:
+            args.append("*")
+            args.extend(code.co_varnames[argcount:argcount + kwonly])
 
     func_node = IRNode(
         name=code.co_name,
@@ -286,19 +273,51 @@ def _build_function_ir(code: types.CodeType, decorators: list = None) -> IRNode:
         decorators=decorators or [],
     )
 
-    func_defs, class_defs = _extract_nested_definitions(code)
-    for func_code in func_defs:
-        func_node.children.append(_build_function_ir(func_code))
+    # Find nested functions/classes in this function
+    nested_defs = _extract_nested_module_definitions(code)
+    for def_info in nested_defs:
+        if def_info["type"] == "class":
+            func_node.children.append(_build_class_ir(def_info["code"], def_info["name"]))
+        else:
+            func_node.children.append(_build_function_ir(def_info["code"]))
 
-    for class_code, class_name in class_defs:
-        func_node.children.append(_build_class_ir(class_code, class_name))
-
-    func_node.body = _extract_body_instructions(code, list(dis.get_instructions(code)))
+    # Extract function body
+    func_node.body = _extract_function_body(code)
 
     return func_node
 
 
+def _extract_nested_module_definitions(code: types.CodeType):
+    """Extract nested definitions from a code object."""
+    definitions = []
+    skip = {"<module>", "<lambda>", "__init__", "__annotate__", "__static_attributes__", "__annotate_func__"}
+
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            if const.co_name not in skip:
+                if _is_class_definition(const):
+                    class_name = _get_class_name(const, code)
+                    if class_name:
+                        definitions.append({"type": "class", "name": class_name, "code": const})
+                else:
+                    definitions.append({"type": "function", "name": const.co_name, "code": const})
+
+    return definitions
+
+
+def _get_class_name(class_code: types.CodeType, parent_code: types.CodeType) -> str | None:
+    """Get the actual class name from the parent code's consts."""
+    for i, const in enumerate(parent_code.co_consts):
+        if const is class_code:
+            if i + 1 < len(parent_code.co_consts):
+                next_const = parent_code.co_consts[i + 1]
+                if isinstance(next_const, str):
+                    return next_const
+    return class_code.co_name
+
+
 def _build_class_ir(code: types.CodeType, name: str, decorators: list = None) -> IRNode:
+    """Build IR for a class."""
     class_node = IRNode(
         name=name,
         ir_type=IRType.CLASS,
@@ -306,325 +325,439 @@ def _build_class_ir(code: types.CodeType, name: str, decorators: list = None) ->
         decorators=decorators or [],
     )
 
+    # Extract methods from class code
     for const in code.co_consts:
         if isinstance(const, types.CodeType):
             if const.co_name not in (
-                "<module>",
-                "<lambda>",
-                "__init__",
-                "__annotate__",
-                "__static_attributes__",
-                "__annotate_func__",
+                "<module>", "<lambda>", "__annotate__", "__static_attributes__", "__annotate_func__"
             ):
-                func_node = _build_function_ir(const)
-                class_node.children.append(func_node)
-
-    class_node.body = []
+                method_node = _build_function_ir(const)
+                class_node.children.append(method_node)
 
     return class_node
 
 
-def _extract_body_instructions(code: types.CodeType, instructions: list) -> list[str]:
-    lines = []
-    stack = []
+def _extract_function_body(code: types.CodeType) -> list[str]:
+    """Extract function body statements from bytecode."""
+    instructions = list(dis.get_instructions(code))
+    emitter = BytecodeEmitter(code)
 
-    skip_ops = {
-        "RESUME",
-        "NOP",
-        "NOT_TAKEN",
-        "CACHE",
-        "PUSH_NULL",
-        "COPY_FREE_VARS",
-        "LOAD_LOCALS",
-        "MAKE_CELL",
-        "LOAD_FAST_BORROW",
-        "SET_FUNCTION_ATTRIBUTE",
-        "STORE_DEREF",
-        "FREEZE_VALUE",
-        "CALL_INTRINSIC_1",
-        "CALL_INTRINSIC_2",
-        "LOAD_BUILD_CLASS",
-        "LIST_EXTEND",
-        "SET_UPDATE",
-        "MAP_ADD",
-        "SETUP_FINALLY",
-        "WITH_EXCEPT_START",
-        "END_FINALLY",
-    }
+    for i, instr in enumerate(instructions):
+        # Skip RESUME at the start
+        if i == 0 and instr.opname == "RESUME":
+            continue
+        emitter.process(instr)
 
-    internal_attrs = {
-        "__module__",
-        "__qualname__",
-        "__doc__",
-        "__class__",
-        "__dict__",
-        "__weakref__",
-    }
+    return emitter.get_statements()
 
-    def popn(n: int):
-        result = []
-        for _ in range(min(n, len(stack))):
-            result.insert(0, stack.pop())
-        return result
 
-    i = 0
-    while i < len(instructions):
-        instr = instructions[i]
+class BytecodeEmitter:
+    """Converts bytecode instructions to Python statements."""
+
+    def __init__(self, code: types.CodeType):
+        self.code = code
+        self.stack: list[str] = []
+        self.statements: list[str] = []
+
+        # Binary operation mapping
+        self.binops = {
+            0: "+", 1: "-", 2: "*", 3: "/", 4: "//", 5: "%", 6: "@",
+            7: "**", 8: ">>", 9: "<<", 10: "&", 11: "^", 12: "|",
+        }
+
+        # Comparison operators
+        self.cmps = {
+            0: "<", 1: "<=", 2: "==", 3: "!=", 4: ">", 5: ">=",
+            8: "is", 9: "is not", 10: "in", 11: "not in"
+        }
+
+        # These opcodes should be skipped
+        self.skip_ops = {
+            "RESUME", "CACHE", "PUSH_NULL", "COPY_FREE_VARS",
+            "LOAD_LOCALS", "MAKE_CELL", "SET_FUNCTION_ATTRIBUTE",
+            "STORE_DEREF", "FREEZE_VALUE", "CALL_INTRINSIC_1",
+            "CALL_INTRINSIC_2", "LOAD_BUILD_CLASS", "SETUP_FINALLY",
+            "WITH_EXCEPT_START", "END_FINALLY", "NOP",
+            "NOT_TAKEN", "LIST_EXTEND", "SET_UPDATE", "MAP_ADD",
+        }
+
+    def get_statements(self) -> list[str]:
+        return self.statements
+
+    def process(self, instr):
         op = instr.opname
         arg = instr.arg
 
-        if op in skip_ops:
-            i += 1
-            continue
+        if op in self.skip_ops:
+            return
 
+        # Stack operations - loads
         if op == "LOAD_CONST":
-            stack.append(_format_const(arg, code))
+            self.stack.append(self._format_const(arg))
 
-        elif op == "LOAD_FAST":
-            stack.append(_get_local_name(arg, code))
+        elif op in ("LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"):
+            self.stack.append(self._get_varname(arg))
 
-        elif op == "LOAD_NAME":
-            stack.append(_get_name(arg, code))
-
-        elif op == "LOAD_GLOBAL":
-            stack.append(_get_global_name(arg, code, instr))
-
-        elif op == "STORE_FAST":
-            if stack and arg is not None:
-                val = stack.pop()
-                name = _get_local_name(arg, code)
-                if name not in internal_attrs:
-                    lines.append(f"{name} = {val}")
-
-        elif op == "STORE_NAME":
-            if stack and arg is not None:
-                val = stack.pop()
-                name = _get_name(arg, code)
-                if name not in internal_attrs:
-                    lines.append(f"{name} = {val}")
-
-        elif op == "CALL":
-            if stack:
-                func = stack.pop()
-                args = popn(arg) if arg else []
-                args_str = ", ".join(args) if args else ""
-
-                if not func.startswith("'"):
-                    result = f"{func}({args_str})" if args_str else f"{func}()"
-                    lines.append(result)
-                stack.clear()
-
-        elif op == "RETURN_VALUE":
-            if stack:
-                val = stack.pop()
-                if val != "None":
-                    lines.append(f"return {val}")
-            else:
-                lines.append("return")
-            break
-
-        elif op == "RAISE_VARARGS":
-            if arg and arg > 0 and stack:
-                exc = stack.pop()
-                if arg == 1:
-                    lines.append(f"raise {exc}")
-                elif arg == 2:
-                    from_val = stack.pop() if stack else "None"
-                    lines.append(f"raise {exc} from {from_val}")
-            else:
-                lines.append("raise")
-
-        elif op == "POP_JUMP_IF_FALSE":
-            if stack:
-                cond = stack.pop()
-                lines.append(f"if {cond}:")
-                lines.append("    pass")
-
-        elif op == "POP_JUMP_IF_TRUE":
-            if stack:
-                cond = stack.pop()
-                lines.append(f"if {cond}:")
-                lines.append("    pass")
-
-        elif op == "FOR_ITER":
-            if stack:
-                target = stack.pop() if stack else "_"
-                lines.append(f"for {target} in ...:")
-                lines.append("    pass")
-
-        elif op == "BUILD_LIST":
-            count = arg if arg else 0
-            items = popn(count)
-            if items:
-                stack.append(f"[{', '.join(items)}]")
-            else:
-                stack.append("[]")
-
-        elif op == "BUILD_TUPLE":
-            count = arg if arg else 0
-            items = popn(count)
-            if items:
-                s = ", ".join(items)
-                stack.append(f"({s},)" if len(items) == 1 else f"({s})")
-            else:
-                stack.append("()")
-
-        elif op == "BUILD_DICT":
-            count = arg if arg else 0
-            items = popn(count * 2)
-            pairs = []
-            for j in range(0, len(items), 2):
-                if j + 1 < len(items):
-                    pairs.append(f"{items[j]}: {items[j + 1]}")
-            if pairs:
-                stack.append(f"{{{', '.join(pairs)}}}")
-            else:
-                stack.append("{}")
-
-        elif op == "BINARY_OP":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(f"({a} + {b})")
-
-        elif op == "BINARY_ADD":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(f"({a} + {b})")
-
-        elif op == "COMPARE_OP":
-            if len(stack) >= 2:
-                b = stack.pop()
-                a = stack.pop()
-                stack.append(f"({a} == {b})")
+        elif op in ("LOAD_NAME", "LOAD_GLOBAL"):
+            self.stack.append(self._get_name(arg))
 
         elif op == "LOAD_ATTR":
-            if stack and arg is not None:
-                attr = _get_attr_name(arg, code, instr)
-                obj = stack.pop() if stack else "self"
-                stack.append(f"{obj}.{attr}")
+            if self.stack:
+                obj = self.stack.pop()
+                attr = self._get_name(arg)
+                self.stack.append(f"{obj}.{attr}")
+
+        elif op == "LOAD_METHOD":
+            if self.stack:
+                obj = self.stack.pop()
+                method = self._get_name(arg)
+                self.stack.append(f"{obj}.{method}")
+
+        elif op == "LOAD_SMALL_INT" or op == "LOAD_SMALL_INTEGER":
+            self.stack.append(str(arg if arg is not None else 0))
+
+        elif op == "LOAD_COMMON_CONSTANT":
+            consts = {0: "None", 1: "False", 2: "True", 3: "Ellipsis", 4: "NotImplemented"}
+            self.stack.append(consts.get(arg, f"const_{arg}"))
+
+        # Store operations
+        elif op in ("STORE_FAST", "STORE_NAME", "STORE_GLOBAL"):
+            if self.stack:
+                val = self.stack.pop()
+                name = self._get_varname(arg) if op == "STORE_FAST" else self._get_name(arg)
+                if name and not name.startswith("__"):
+                    self.statements.append(f"{name} = {val}")
 
         elif op == "STORE_ATTR":
-            if len(stack) >= 2 and arg is not None:
-                val = stack.pop()
-                attr = _get_attr_name(arg, code, instr)
-                obj = stack.pop() if stack else "self"
-                lines.append(f"{obj}.{attr} = {val}")
+            if len(self.stack) >= 1:
+                val = self.stack.pop()
+                obj = self.stack.pop() if self.stack else "self"
+                attr = self._get_name(arg)
+                self.statements.append(f"{obj}.{attr} = {val}")
 
-        elif op == "SUBSCR":
-            if len(stack) >= 2:
-                idx = stack.pop()
-                obj = stack.pop() if stack else "_"
-                stack.append(f"{obj}[{idx}]")
+        # Call operations
+        elif op in ("CALL", "CALL_FUNCTION"):
+            self._emit_call(arg)
 
-        elif op in ("POP_TOP", "ROT_TWO", "ROT_THREE", "ROT_FOUR"):
-            if stack:
-                stack.pop()
+        elif op == "CALL_KW":
+            # Keyword call - pop kwargs dict then args
+            self._emit_kw_call(arg)
 
-        i += 1
+        elif op == "CALL_METHOD":
+            self._emit_method_call(arg)
 
-    return lines
+        # Binary operations
+        elif op == "BINARY_OP":
+            self._emit_binary_op(arg)
 
+        elif op == "UNARY_NOT" and self.stack:
+            val = self.stack.pop()
+            self.stack.append(f"not {val}")
 
-def _format_const(arg: int | None, code: types.CodeType) -> str:
-    if arg is None or arg >= len(code.co_consts):
-        return "None"
-    c = code.co_consts[arg]
-    if c is None:
-        return "None"
-    if c is Ellipsis:
-        return "..."
-    if isinstance(c, bool):
-        return "True" if c else "False"
-    if isinstance(c, str):
-        if len(c) > 50:
-            return f"'{c[:50]}...'"
-        return f"'{c}'"
-    if isinstance(c, bytes):
-        return f"b'{c[:20].decode('utf-8', errors='replace')}...'"
-    if isinstance(c, (int, float)):
-        return str(c)
-    if isinstance(c, tuple):
-        items = [str(x) for x in c]
-        return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
-    if isinstance(c, (list, dict, set)):
-        return "[]" if isinstance(c, list) else "{}"
-    return repr(c)
+        # Comparison
+        elif op == "COMPARE_OP":
+            self._emit_compare(arg)
 
+        elif op == "CONTAINS_OP":
+            if len(self.stack) >= 2:
+                obj = self.stack.pop()
+                container = self.stack.pop() if self.stack else "_"
+                if arg == 1:  # not in
+                    self.stack.append(f"{obj} not in {container}")
+                else:
+                    self.stack.append(f"{obj} in {container}")
 
-def _get_local_name(arg: int | None, code: types.CodeType) -> str:
-    if arg is None:
-        return "_"
-    if arg < len(code.co_varnames):
-        return code.co_varnames[arg]
-    return f"var_{arg}"
+        # Building containers
+        elif op == "BUILD_TUPLE":
+            self._emit_build_tuple(arg)
 
+        elif op == "BUILD_LIST":
+            self._emit_build_list(arg)
 
-def _get_name(arg: int | None, code: types.CodeType) -> str:
-    if arg is None:
-        return "_"
-    if arg < len(code.co_names):
-        return code.co_names[arg]
-    return f"name_{arg}"
+        elif op == "BUILD_DICT":
+            self._emit_build_dict(arg)
 
+        elif op == "BUILD_SET":
+            self._emit_build_set(arg)
 
-def _get_global_name(arg: int | None, code: types.CodeType, instr) -> str:
-    if arg is None:
-        return "_"
-    idx = arg >> 1
-    argrepr = instr.argrepr
-    if idx < len(code.co_names):
-        if "+ NULL" in argrepr:
-            return argrepr.split(" + NULL")[0]
-        return code.co_names[idx]
-    return f"_global_{idx}"
+        elif op == "BUILD_SLICE":
+            self._emit_build_slice(arg)
 
+        # Subscript operations
+        elif op == "BINARY_SUBSCR" or op == "SUBSCR":
+            if len(self.stack) >= 2:
+                idx = self.stack.pop()
+                obj = self.stack.pop() if self.stack else "_"
+                self.stack.append(f"{obj}[{idx}]")
 
-def _get_attr_name(arg: int | None, code: types.CodeType, instr) -> str:
-    if arg is None:
-        return "attr"
-    argrepr = instr.argrepr
-    if "+ NULL|" in argrepr:
-        return argrepr.split(" + NULL|")[0]
-    if " + NULL" in argrepr:
-        return argrepr.split(" + NULL")[0]
-    if arg < len(code.co_names):
-        return code.co_names[arg]
-    return f"attr_{arg}"
+        elif op == "STORE_SUBSCR":
+            if len(self.stack) >= 3:
+                val = self.stack.pop()
+                idx = self.stack.pop()
+                obj = self.stack.pop() if self.stack else "_"
+                self.statements.append(f"{obj}[{idx}] = {val}")
+
+        # Return
+        elif op == "RETURN_VALUE":
+            if self.stack:
+                val = self.stack.pop()
+                if val != "None":
+                    self.statements.append(f"return {val}")
+
+        # Raises
+        elif op == "RAISE_VARARGS":
+            if arg == 0:
+                self.statements.append("raise")
+            elif self.stack:
+                exc = self.stack.pop()
+                self.statements.append(f"raise {exc}")
+
+        # Jumps (simplified)
+        elif op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
+            if self.stack:
+                cond = self.stack.pop()
+                self.statements.append(f"if {cond}:")
+                self.statements.append("    pass")
+
+        elif op == "FOR_ITER":
+            self.statements.append("for _ in _:")
+            self.statements.append("    pass")
+            self.stack.clear()
+
+        # Cleanup operations
+        elif op in ("POP_TOP", "ROT_TWO", "ROT_THREE", "ROT_FOUR", "SWAP"):
+            if self.stack:
+                self.stack.pop()
+
+    def _get_varname(self, arg: int | None) -> str:
+        if arg is None:
+            return "_"
+        if arg < len(self.code.co_varnames):
+            return self.code.co_varnames[arg]
+        return f"var_{arg}"
+
+    def _get_name(self, arg: int | None) -> str:
+        if arg is None:
+            return "_"
+        # For LOAD_GLOBAL, arg is shifted
+        idx = arg >> 1 if arg else arg
+        if idx is not None and idx < len(self.code.co_names):
+            return self.code.co_names[idx]
+        if arg is not None and arg < len(self.code.co_names):
+            return self.code.co_names[arg]
+        return f"name_{arg}"
+
+    def _format_const(self, arg: int | None) -> str:
+        if arg is None or arg >= len(self.code.co_consts):
+            return "None"
+        c = self.code.co_consts[arg]
+        if c is None:
+            return "None"
+        if c is Ellipsis:
+            return "..."
+        if isinstance(c, bool):
+            return "True" if c else "False"
+        if isinstance(c, str):
+            escaped = c.replace("'", "\\'").replace("\\", "\\\\").replace("\n", "\\n")
+            return f"'{escaped}'"
+        if isinstance(c, bytes):
+            try:
+                decoded = c[:20].decode('utf-8', errors='replace')
+                return f"b'{decoded}...'"
+            except:
+                return f"b'{c[:20].hex()}...'"
+        if isinstance(c, (int, float)):
+            return str(c)
+        if isinstance(c, tuple):
+            items = [repr(x) if isinstance(x, (int, str, float, bool)) else str(x)[:30] for x in c]
+            return f"({', '.join(items)},)" if len(c) == 1 else f"({', '.join(items)})"
+        if isinstance(c, types.CodeType):
+            return f"<code:{c.co_name}>"
+        return repr(c)[:50]
+
+    def _emit_call(self, argc: int | None):
+        """Emit a function call."""
+        if argc is None:
+            argc = 0
+
+        args = []
+        for _ in range(min(argc, len(self.stack))):
+            args.insert(0, self.stack.pop())
+
+        if self.stack:
+            func = self.stack.pop()
+            # Clean up the function name
+            if " + NULL" in func:
+                func = func.split(" + NULL")[0]
+            if " + NULL|" in func:
+                func = func.split(" + NULL|")[0]
+
+            args_str = ", ".join(args)
+            call_str = f"{func}({args_str})"
+            self.stack.append(call_str)
+        else:
+            self.stack.append(f"call({', '.join(args)})")
+
+    def _emit_kw_call(self, argc: int | None):
+        """Emit a function call with keyword arguments."""
+        # CALL_KW: pop kwargs dict, then argc args
+        if self.stack:
+            kwargs = self.stack.pop()  # This should be the kwargs dict
+        else:
+            kwargs = ""
+
+        if argc is None:
+            argc = 0
+        argc = max(0, argc - 1)  # Adjust for kwargs dict
+
+        args = []
+        for _ in range(min(argc, len(self.stack))):
+            args.insert(0, self.stack.pop())
+
+        if self.stack:
+            func = self.stack.pop()
+            if " + NULL" in func:
+                func = func.split(" + NULL")[0]
+
+            args_str = ", ".join(args)
+            if kwargs and kwargs != "None":
+                # Try to reconstruct kwargs
+                args_str += f", {kwargs}"
+            self.stack.append(f"{func}({args_str})")
+        else:
+            self.stack.append(f"kwcall({', '.join(args)})")
+
+    def _emit_method_call(self, argc: int | None):
+        """Emit a method call."""
+        if argc is None:
+            argc = 0
+
+        args = []
+        for _ in range(min(argc, len(self.stack))):
+            args.insert(0, self.stack.pop())
+
+        if self.stack:
+            method = self.stack.pop()
+            args_str = ", ".join(args)
+            self.stack.append(f"{method}({args_str})")
+        else:
+            self.stack.append(f".method({', '.join(args)})")
+
+    def _emit_binary_op(self, arg: int | None):
+        if len(self.stack) < 2:
+            return
+        right = self.stack.pop()
+        left = self.stack.pop()
+        op = self.binops.get(arg, "+")
+        self.stack.append(f"({left} {op} {right})")
+
+    def _emit_compare(self, arg: int | None):
+        if len(self.stack) < 2:
+            return
+        right = self.stack.pop()
+        left = self.stack.pop()
+        cmp = self.cmps.get(arg, "==")
+        self.stack.append(f"({left} {cmp} {right})")
+
+    def _emit_build_tuple(self, count: int | None):
+        if count is None:
+            count = 0
+        items = []
+        for _ in range(min(count, len(self.stack))):
+            items.insert(0, self.stack.pop())
+        if len(items) == 1:
+            self.stack.append(f"({items[0]},)")
+        else:
+            self.stack.append(f"({', '.join(items)})")
+
+    def _emit_build_list(self, count: int | None):
+        if count is None:
+            count = 0
+        items = []
+        for _ in range(min(count, len(self.stack))):
+            items.insert(0, self.stack.pop())
+        self.stack.append(f"[{', '.join(items)}]")
+
+    def _emit_build_dict(self, count: int | None):
+        if count is None:
+            count = 0
+        pairs = []
+        for _ in range(min(count, len(self.stack) // 2)):
+            if len(self.stack) >= 2:
+                v = self.stack.pop()
+                k = self.stack.pop()
+                pairs.insert(0, f"{k}: {v}")
+        self.stack.append(f"{{{', '.join(pairs)}}}")
+
+    def _emit_build_set(self, count: int | None):
+        if count is None:
+            count = 0
+        items = []
+        for _ in range(min(count, len(self.stack))):
+            items.insert(0, self.stack.pop())
+        self.stack.append(f"{{{', '.join(items)}}}")
+
+    def _emit_build_slice(self, argc: int | None):
+        if argc == 2:
+            stop = self.stack.pop() if self.stack else ""
+            start = self.stack.pop() if self.stack else ""
+            self.stack.append(f"{start}:{stop}")
+        elif argc == 3:
+            step = self.stack.pop() if self.stack else ""
+            stop = self.stack.pop() if self.stack else ""
+            start = self.stack.pop() if self.stack else ""
+            self.stack.append(f"{start}:{stop}:{step}")
 
 
 def _emit_ir(node: IRNode, indent: int = 0) -> str:
+    """Emit Python source from IR."""
     prefix = "    " * indent
     lines = []
 
     if node.ir_type == IRType.MODULE:
         for imp in node.imports:
             lines.append(imp)
+        if node.imports:
+            lines.append("")
 
-        for child in node.children:
+        for i, child in enumerate(node.children):
             lines.append(_emit_ir(child, indent))
+            if i < len(node.children) - 1:
+                lines.append("")
 
     elif node.ir_type == IRType.CLASS:
         for dec in node.decorators:
             lines.append(f"@{dec}")
         lines.append(f"class {node.name}:")
-        for child in node.children:
-            lines.append(_emit_ir(child, indent + 1))
-        for stmt in node.body:
-            if stmt.strip():
-                lines.append(f"    {prefix}{stmt}")
+
+        if node.children:
+            for child in node.children:
+                lines.append(_emit_ir(child, indent + 1))
+        else:
+            lines.append(f"{prefix}    pass")
 
     elif node.ir_type == IRType.FUNCTION:
         for dec in node.decorators:
             lines.append(f"@{dec}")
         args_str = ", ".join(node.args) if node.args else ""
         lines.append(f"def {node.name}({args_str}):")
+
+        has_content = False
+
+        # Nested definitions
         for child in node.children:
             lines.append(_emit_ir(child, indent + 1))
-        for stmt in node.body:
-            if stmt.strip():
-                lines.append(f"    {prefix}{stmt}")
+            has_content = True
+
+        # Function body
+        if node.body:
+            for stmt in node.body:
+                if stmt.strip():
+                    lines.append(f"{prefix}    {stmt}")
+                    has_content = True
+
+        if not has_content:
+            lines.append(f"{prefix}    pass")
 
     return "\n".join(lines)
 
