@@ -51,6 +51,171 @@ class ReconstructResult:
     message: str
 
 
+@dataclass
+class BasicBlock:
+    """A control flow block - straight-line instructions with single entry."""
+    start_offset: int
+    instructions: list = field(default_factory=list)
+    successors: list["BasicBlock"] = field(default_factory=list)
+    predecessors: list["BasicBlock"] = field(default_factory=list)
+    except_edges: list["BasicBlock"] = field(default_factory=list)  # For TRY blocks
+
+    @property
+    def end_offset(self) -> int:
+        if self.instructions:
+            return self.instructions[-1].offset
+        return self.start_offset
+
+    @property
+    def is_terminator(self) -> bool:
+        if not self.instructions:
+            return False
+        last_op = self.instructions[-1].opname
+        return last_op in ("RETURN_VALUE", "RAISE_VARARGS")
+
+
+class CFGBuilder:
+    """Builds control flow graph from bytecode."""
+
+    def __init__(self, code: types.CodeType):
+        self.code = code
+        self.instructions = list(dis.get_instructions(code))
+        self.blocks: dict[int, BasicBlock] = {}  # start_offset -> block
+        self.offset_to_idx: dict[int, int] = {}  # offset -> instruction index
+
+        for i, instr in enumerate(self.instructions):
+            self.offset_to_idx[instr.offset] = i
+
+    def build(self) -> list[BasicBlock]:
+        """Build CFG and return list of blocks."""
+        # Step 1: Find all block leaders (entry points)
+        leaders = self._find_block_leaders()
+
+        # Step 2: Create blocks and assign instructions
+        self._create_blocks(leaders)
+
+        # Step 3: Connect edges (successors)
+        self._connect_edges()
+
+        return list(self.blocks.values())
+
+    def _find_block_leaders(self) -> set[int]:
+        """Find all instruction offsets that start a new block."""
+        leaders = {0}  # First instruction is always a leader
+
+        for i, instr in enumerate(self.instructions):
+            op = instr.opname
+
+            # A: Jump targets start new blocks
+            if hasattr(instr, 'jump_target') and instr.jump_target is not None:
+                leaders.add(instr.jump_target)
+
+            # For opcodes with jump targets, also mark fallthrough
+            if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+                      "JUMP_IF_TRUE", "JUMP_IF_FALSE",
+                      "FOR_ITER"):
+                # Fallthrough to next instruction
+                if i + 1 < len(self.instructions):
+                    leaders.add(self.instructions[i + 1].offset)
+
+            # B: Instructions after terminators start new blocks
+            if op in ("RETURN_VALUE", "RAISE_VARARGS"):
+                if i + 1 < len(self.instructions):
+                    leaders.add(self.instructions[i + 1].offset)
+
+            # C: JUMP_ABSOLUTE/JUMP_FORWARD target next instr
+            if op in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                if hasattr(instr, 'jump_target') and instr.jump_target is not None:
+                    leaders.add(instr.jump_target)
+                # Instruction after unconditional jump is a leader (if any)
+                if i + 1 < len(self.instructions):
+                    leaders.add(self.instructions[i + 1].offset)
+
+        return leaders
+
+    def _create_blocks(self, leaders: set[int]):
+        """Create blocks and assign instructions to them."""
+        current_block = None
+
+        for instr in self.instructions:
+            # Start new block if this instruction is a leader
+            if instr.offset in leaders and (current_block is None or instr.offset != current_block.start_offset):
+                current_block = BasicBlock(start_offset=instr.offset)
+                self.blocks[instr.offset] = current_block
+
+            # Add instruction to current block
+            if current_block is not None:
+                current_block.instructions.append(instr)
+
+    def _connect_edges(self):
+        """Connect block successors based on control flow."""
+        block_starts = sorted(self.blocks.keys())
+
+        for block in self.blocks.values():
+            if not block.instructions:
+                continue
+
+            last_instr = block.instructions[-1]
+            op = last_instr.opname
+
+            # Unconditional jump: 1 successor
+            if op in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                if hasattr(last_instr, 'jump_target') and last_instr.jump_target is not None:
+                    target_block = self.blocks.get(last_instr.jump_target)
+                    if target_block:
+                        block.successors.append(target_block)
+                        target_block.predecessors.append(block)
+
+            # Conditional jump: 2 successors (true branch, false/fallthrough)
+            elif op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+                       "JUMP_IF_TRUE", "JUMP_IF_FALSE"):
+                # Jump target (taken branch)
+                if hasattr(last_instr, 'jump_target') and last_instr.jump_target is not None:
+                    target_block = self.blocks.get(last_instr.jump_target)
+                    if target_block and target_block not in block.successors:
+                        block.successors.append(target_block)
+                        target_block.predecessors.append(block)
+
+                # Fallthrough (not taken)
+                next_block = self._get_next_block(block.end_offset)
+                if next_block and next_block not in block.successors:
+                    block.successors.append(next_block)
+                    next_block.predecessors.append(block)
+
+            # FOR_ITER: 2 successors (loop body, exit)
+            elif op == "FOR_ITER":
+                # Jump target is loop exit
+                if hasattr(last_instr, 'jump_target') and last_instr.jump_target is not None:
+                    exit_block = self.blocks.get(last_instr.jump_target)
+                    if exit_block and exit_block not in block.successors:
+                        block.successors.append(exit_block)
+                        exit_block.predecessors.append(block)
+
+                # Fallthrough is loop body
+                next_block = self._get_next_block(block.end_offset)
+                if next_block and next_block not in block.successors:
+                    block.successors.append(next_block)
+                    next_block.predecessors.append(block)
+
+            # Return/Raise: 0 successors (terminator)
+            elif op in ("RETURN_VALUE", "RAISE_VARARGS"):
+                pass  # No successors
+
+            # Default: fallthrough to next block
+            else:
+                next_block = self._get_next_block(block.end_offset)
+                if next_block and next_block not in block.successors:
+                    block.successors.append(next_block)
+                    next_block.predecessors.append(block)
+
+    def _get_next_block(self, after_offset: int) -> BasicBlock | None:
+        """Get the block starting after given offset."""
+        for start, block in self.blocks.items():
+            if start > after_offset:
+                return block
+        return None
+
+
 def reconstruct(pyc_path: Path, output_path: Path | None = None) -> ReconstructResult:
     if not pyc_path.exists():
         return ReconstructResult(False, None, "File not found")
