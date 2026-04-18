@@ -91,13 +91,14 @@ def _detect_platform(path: Path) -> str:
 def _find_cookie(path: Path) -> int:
     """Find PyInstaller cookie in file."""
     with open(path, "rb") as f:
-        return _find_cookie_from_file(f)
+        f.seek(0, 2)
+        file_size = f.tell()
+        return _find_cookie_from_file(f, file_size)
 
 
-def _find_cookie_from_file(f) -> int:
+def _find_cookie_from_file(f, file_size: int) -> int:
     """Find PyInstaller cookie from file object."""
-    f.seek(0, 2)
-    file_size = f.tell()
+    # Use file_size passed as argument instead of calculating it inside the function
 
     chunk_size = 8192
     cookie_pos = -1
